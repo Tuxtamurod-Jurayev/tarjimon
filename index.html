@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="uz">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌐</text></svg>" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TarjimaAI - PDF, DOCX va Hujjatlarni Inglizchadan O'zbekchaga Tarjima Qilish</title>
+    <meta name="description" content="Ingliz tilidan O'zbek tiliga PDF, DOCX, DOC va matnli hujjatlarni to'liq sifatli tarjima qilish va fayl ko'rinishida (DOCX, PDF, TXT) yuklab olish dasturi." />
+    <meta name="keywords" content="tarjima, english uzbek translator, pdf tarjima, docx tarjima, inglizcha ozbekcha, tarjimon dastur" />
+    <meta name="theme-color" content="#0f172a" />
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <!-- PDF.js CDN for extracting text from PDF files reliably -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+      if (window.pdfjsLib) {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
