@@ -3,8 +3,8 @@ import { translateSingleText } from "./translator";
 import { jsPDF } from "jspdf";
 
 /**
- * Anime, Manga va Webtoon kitoblarini (PDF va Rasmlar)
- * rasmni buzmasdan faqat so'zlarni o'zbekchaga tarjima qilish tizimi
+ * Anime, Manga va Webtoon rasmlari va PDF kitoblarini
+ * rasmni buzmasdan faqat so'zlarni o'zbekchaga o'tkazish tizimi
  */
 
 let ocrWorker = null;
@@ -12,14 +12,14 @@ let ocrWorker = null;
 // Tesseract OCR ishchisini tayyorlash
 export async function getOcrWorker(onProgress) {
   if (!ocrWorker) {
-    if (onProgress) onProgress("OCR dvigateli ishga tushirilmoqda...");
+    if (onProgress) onProgress("OCR dvigateli yuklanmoqda...");
     ocrWorker = await createWorker("eng");
   }
   return ocrWorker;
 }
 
 /**
- * PDF faylni sahifama-sahifa yuqori sifatli (High-Res) rasmlarga aylantirish
+ * PDF kitobni sahifama-sahifa yuqori sifatli rasmlarga aylantirish
  */
 export async function loadPdfPages(file, onProgress) {
   if (!window.pdfjsLib) {
@@ -35,7 +35,7 @@ export async function loadPdfPages(file, onProgress) {
 
   for (let i = 1; i <= numPages; i++) {
     if (onProgress) {
-      onProgress(`PDF sahifasi tayyorlanmoqda: ${i}/${numPages}...`);
+      onProgress(`Anime kitobi sahifalari tayyorlanmoqda: ${i}/${numPages}...`);
     }
 
     const page = await pdf.getPage(i);
@@ -61,28 +61,26 @@ export async function loadPdfPages(file, onProgress) {
 }
 
 /**
- * Rasmdagi pufakcha fon rangi (Background) va matn rangini avtomatik aniqlash
+ * Pufakchaning fon rangi (oq yoki qora/quest) va matn rangini aniqlash
  */
-function sampleColorsAtBox(ctx, box) {
+function detectBoxColors(ctx, box) {
   try {
-    // Matn atrofidagi 4 ta nuqtadan rang namunasini olish
-    const samplePoints = [
-      { x: Math.max(0, box.x0 - 4), y: Math.max(0, box.y0 - 4) },
-      { x: Math.min(ctx.canvas.width - 1, box.x1 + 4), y: Math.max(0, box.y0 - 4) },
-      { x: Math.max(0, box.x0 - 4), y: Math.min(ctx.canvas.height - 1, box.y1 + 4) },
-      { x: Math.round((box.x0 + box.x1) / 2), y: Math.max(0, box.y0 - 3) }
+    const margin = 3;
+    const sampleCoords = [
+      { x: Math.max(0, box.x0 - margin), y: Math.max(0, box.y0 - margin) },
+      { x: Math.min(ctx.canvas.width - 1, box.x1 + margin), y: Math.max(0, box.y0 - margin) },
+      { x: Math.max(0, box.x0 - margin), y: Math.min(ctx.canvas.height - 1, box.y1 + margin) },
+      { x: Math.round((box.x0 + box.x1) / 2), y: Math.max(0, box.y0 - margin) }
     ];
 
-    let totalR = 0, totalG = 0, totalB = 0;
-    let count = 0;
+    let totalR = 0, totalG = 0, totalB = 0, count = 0;
 
-    for (const pt of samplePoints) {
-      const pixel = ctx.getImageData(pt.x, pt.y, 1, 1).data;
-      // Agar oq yoki shaffof bo'lmasa
-      if (pixel[3] > 50) {
-        totalR += pixel[0];
-        totalG += pixel[1];
-        totalB += pixel[2];
+    for (const pt of sampleCoords) {
+      const p = ctx.getImageData(pt.x, pt.y, 1, 1).data;
+      if (p[3] > 40) {
+        totalR += p[0];
+        totalG += p[1];
+        totalB += p[2];
         count++;
       }
     }
@@ -92,20 +90,14 @@ function sampleColorsAtBox(ctx, box) {
     const r = Math.round(totalR / count);
     const g = Math.round(totalG / count);
     const b = Math.round(totalB / count);
-
     const brightness = (r * 299 + g * 587 + b * 114) / 1000;
 
-    // Agar fon yorug' bo'lsa (oq manga pufakchasi)
-    if (brightness > 160) {
-      return {
-        bgColor: "#FFFFFF",
-        textColor: "#000000"
-      };
+    if (brightness > 140) {
+      return { bgColor: "#FFFFFF", textColor: "#000000" };
     } else {
-      // Agar fon to'q bo'lsa (Masalan: Main Quest, Qora pufakcha yoki tizim oynasi)
       return {
         bgColor: `rgb(${r}, ${g}, ${b})`,
-        textColor: brightness < 80 ? "#FFFFFF" : "#FFF9D2"
+        textColor: brightness < 60 ? "#FFFFFF" : "#FFE082"
       };
     }
   } catch {
@@ -114,100 +106,118 @@ function sampleColorsAtBox(ctx, box) {
 }
 
 /**
- * Rasmdagi inglizcha matnlarni OCR orqali aniqlash
+ * Rasmdagi inglizcha matnlarni OCR orqali aniqlash va dialog pufakchalariga birlashtirish
  */
 export async function detectMangaText(imageElement, onProgress) {
-  if (onProgress) onProgress("Anime/Manga sahifasidagi matnlar skanerlanmoqda...");
+  if (onProgress) onProgress("Anime sahifasidagi matnlar skanerlanmoqda (OCR)...");
 
   const worker = await getOcrWorker();
-  const ret = await worker.recognize(imageElement);
 
-  const lines = ret.data.lines || [];
-  const textBlocks = [];
+  // Muhim: Tesseract v5 da bboxes chiqishi uchun { blocks: true, text: true } berilishi SHART!
+  const ret = await worker.recognize(imageElement, {}, { blocks: true, text: true });
 
-  // Vaqtinchalik canvas ranglarni aniqlash uchun
+  const extractedLines = [];
+
+  if (ret.data && ret.data.blocks) {
+    for (const block of ret.data.blocks) {
+      if (!block.paragraphs) continue;
+      for (const p of block.paragraphs) {
+        if (!p.lines) continue;
+        for (const l of p.lines) {
+          const cleanText = (l.text || "").trim();
+          // Kamida 2 ta harf va fon shovqinlarini chiqarib tashlash
+          if (cleanText.length >= 2 && l.confidence >= 50) {
+            extractedLines.push({
+              text: cleanText,
+              confidence: l.confidence,
+              bbox: l.bbox
+            });
+          }
+        }
+      }
+    }
+  }
+
+  if (extractedLines.length === 0) {
+    return [];
+  }
+
+  // Qatorlarni mantiqiy dialog pufakchalariga (speech boxes) birlashtirish
+  const mergedBoxes = [];
+  let currentBox = null;
+
+  for (let i = 0; i < extractedLines.length; i++) {
+    const line = extractedLines[i];
+    if (!currentBox) {
+      currentBox = {
+        text: line.text,
+        x0: line.bbox.x0,
+        y0: line.bbox.y0,
+        x1: line.bbox.x1,
+        y1: line.bbox.y1
+      };
+    } else {
+      const vDist = line.bbox.y0 - currentBox.y1;
+      const hOverlap =
+        Math.min(line.bbox.x1, currentBox.x1) - Math.max(line.bbox.x0, currentBox.x0);
+
+      // Agar qatorlar bir-biriga vertikal yaqin (bitta pufakcha ichida) bo'lsa
+      if (vDist <= 28 && hOverlap >= -45) {
+        currentBox.text += " " + line.text;
+        currentBox.x0 = Math.min(currentBox.x0, line.bbox.x0);
+        currentBox.y0 = Math.min(currentBox.y0, line.bbox.y0);
+        currentBox.x1 = Math.max(currentBox.x1, line.bbox.x1);
+        currentBox.y1 = Math.max(currentBox.y1, line.bbox.y1);
+      } else {
+        mergedBoxes.push(currentBox);
+        currentBox = {
+          text: line.text,
+          x0: line.bbox.x0,
+          y0: line.bbox.y0,
+          x1: line.bbox.x1,
+          y1: line.bbox.y1
+        };
+      }
+    }
+  }
+  if (currentBox) mergedBoxes.push(currentBox);
+
+  // Ranglar va pufakcha ma'lumotlarini to'ldirish
   const tempCanvas = document.createElement("canvas");
   tempCanvas.width = imageElement.naturalWidth || imageElement.width;
   tempCanvas.height = imageElement.naturalHeight || imageElement.height;
   const tempCtx = tempCanvas.getContext("2d");
   tempCtx.drawImage(imageElement, 0, 0);
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const text = (line.text || "").trim();
+  const finalBlocks = mergedBoxes.map((b, idx) => {
+    const width = b.x1 - b.x0;
+    const height = b.y1 - b.y0;
+    const colors = detectBoxColors(tempCtx, b);
 
-    // Kamida 2 ta belgi va tushunarli aniqlik
-    if (text.length >= 2 && line.confidence > 25) {
-      const box = {
-        x0: line.bbox.x0,
-        y0: line.bbox.y0,
-        x1: line.bbox.x1,
-        y1: line.bbox.y1,
-        width: line.bbox.x1 - line.bbox.x0,
-        height: line.bbox.y1 - line.bbox.y0
-      };
+    return {
+      id: "bubble_" + idx + "_" + Date.now(),
+      text: b.text,
+      translatedText: "",
+      bbox: {
+        x0: b.x0,
+        y0: b.y0,
+        x1: b.x1,
+        y1: b.y1,
+        width,
+        height
+      },
+      fontSize: Math.max(11, Math.min(22, Math.round(height * 0.45))),
+      bgColor: colors.bgColor,
+      textColor: colors.textColor,
+      isUppercase: b.text === b.text.toUpperCase()
+    };
+  });
 
-      const colors = sampleColorsAtBox(tempCtx, box);
-
-      textBlocks.push({
-        id: "box_" + i + "_" + Date.now(),
-        text: text,
-        translatedText: "",
-        bbox: box,
-        fontSize: Math.max(12, Math.round(box.height * 0.72)),
-        bgColor: colors.bgColor,
-        textColor: colors.textColor,
-        isUppercase: text === text.toUpperCase() // Agar inglizchada bosh harflar bo'lsa
-      });
-    }
-  }
-
-  // Yaqin qatorlarni (bitta pufakchadagi matnlarni) birlashtirish
-  return mergeDialogueBlocks(textBlocks);
-}
-
-// Bitta pufakchadagi qatorlarni birlashtirish
-function mergeDialogueBlocks(blocks) {
-  if (blocks.length <= 1) return blocks;
-
-  const merged = [];
-  const visited = new Set();
-
-  for (let i = 0; i < blocks.length; i++) {
-    if (visited.has(i)) continue;
-
-    let curr = { ...blocks[i] };
-    visited.add(i);
-
-    for (let j = i + 1; j < blocks.length; j++) {
-      if (visited.has(j)) continue;
-      const candidate = blocks[j];
-
-      const vGap = Math.abs(candidate.bbox.y0 - curr.bbox.y1);
-      const hOverlap =
-        Math.min(curr.bbox.x1, candidate.bbox.x1) - Math.max(curr.bbox.x0, candidate.bbox.x0);
-
-      // Agar qatorlar bitta pufakchaga tegishli bo'lsa (vertikal yaqin va ustma-ust)
-      if (vGap <= 22 && hOverlap >= -35) {
-        curr.text += " " + candidate.text;
-        curr.bbox.x0 = Math.min(curr.bbox.x0, candidate.bbox.x0);
-        curr.bbox.y0 = Math.min(curr.bbox.y0, candidate.bbox.y0);
-        curr.bbox.x1 = Math.max(curr.bbox.x1, candidate.bbox.x1);
-        curr.bbox.y1 = Math.max(curr.bbox.y1, candidate.bbox.y1);
-        curr.bbox.width = curr.bbox.x1 - curr.bbox.x0;
-        curr.bbox.height = curr.bbox.y1 - curr.bbox.y0;
-        visited.add(j);
-      }
-    }
-
-    merged.push(curr);
-  }
-
-  return merged;
+  return finalBlocks;
 }
 
 /**
- * Aniqlangan matnlarni O'zbek tiliga tarjima qilish
+ * Aniqlangan pufakcha matnlarini o'zbek tiliga tarjima qilish
  */
 export async function translateMangaBlocks(blocks, onProgress) {
   const total = blocks.length;
@@ -222,7 +232,6 @@ export async function translateMangaBlocks(blocks, onProgress) {
     try {
       let uzText = await translateSingleText(block.text, "en", "uz");
 
-      // Agar original matn faqat KATTA HARFLARDA (ALL CAPS) bo'lsa (anime manga an'anasi)
       if (block.isUppercase) {
         uzText = uzText.toUpperCase();
       }
@@ -243,14 +252,14 @@ export async function translateMangaBlocks(blocks, onProgress) {
 }
 
 /**
- * Canvas ustiga tarjima matnini chizish (Asl rasmni o'zgartirmasdan!)
+ * Canvas ustiga tarjima matnini chizish (Asl chizma va san'at 100% buzilmaydi!)
  */
 export function renderMangaPage({
   canvas,
   image,
   blocks,
   showOriginal = false,
-  padding = 5
+  padding = 6
 }) {
   if (!canvas || !image) return;
 
@@ -258,12 +267,12 @@ export function renderMangaPage({
   canvas.width = image.naturalWidth || image.width;
   canvas.height = image.naturalHeight || image.height;
 
-  // 1. Asl rasm/sahifani to'liq 100% chizish (Rasm chizmasi buzilmaydi)
+  // 1. Asl rasm/sahifani to'liq chizish (San'at va qahramonlar butun qoladi)
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
 
   if (showOriginal) return;
 
-  // 2. Har bir dialog pufakchasini yangilash
+  // 2. Har bir dialog pufakchasidagi inglizcha so'zlarni tozalab, o'zbekchasini chizish
   for (const block of blocks) {
     const textToDraw = (block.translatedText || block.text || "").trim();
     if (!textToDraw) continue;
@@ -277,7 +286,7 @@ export function renderMangaPage({
 
     ctx.save();
 
-    // 2.1. Inglizcha so'zni o'chirish (Pufakcha fon rangi bilan qoplash)
+    // 2.1. Inglizcha so'zni pufakchaning fon rangi bilan qoplash
     ctx.fillStyle = block.bgColor || "#FFFFFF";
     ctx.beginPath();
     const cornerRadius = Math.min(6, boxW / 6, boxH / 6);
@@ -292,7 +301,7 @@ export function renderMangaPage({
     let fontSize = block.fontSize || 14;
     ctx.font = `bold ${fontSize}px sans-serif`;
 
-    // So'zlarni pufakcha kengligiga mos qilib qatorlarga o'rash
+    // So'zlarni pufakcha kengligi bo'yicha qatorlarga ajratish (Word wrap)
     const words = textToDraw.split(/\s+/);
     let lines = [];
     let currentLine = words[0] || "";
@@ -309,7 +318,7 @@ export function renderMangaPage({
     }
     if (currentLine) lines.push(currentLine);
 
-    // Agar matn bo'yiga sig'may qolsa, shriftni avtomatik moslashtirish
+    // Agar matn bo'yiga sig'may qolsa, shriftni avtomatik kichraytirish
     const lineHeight = fontSize * 1.25;
     const totalH = lines.length * lineHeight;
     if (totalH > boxH && fontSize > 9) {
@@ -329,14 +338,13 @@ export function renderMangaPage({
 }
 
 /**
- * Barcha tarjima qilingan sahifalarni to'liq PDF kitob shaklida eksport qilish
+ * Barcha tarjima qilingan sahifalarni to'liq PDF kitob shaklida saqlash
  */
 export async function exportAllPagesToPdf(renderedCanvases, bookTitle = "Anime_Tarjima") {
   if (!renderedCanvases || renderedCanvases.length === 0) {
     throw new Error("Eksport qilish uchun sahifalar mavjud emas");
   }
 
-  // Birinchi sahifa o'lchamida PDF boshlash
   const first = renderedCanvases[0];
   const orientation = first.width > first.height ? "landscape" : "portrait";
 
