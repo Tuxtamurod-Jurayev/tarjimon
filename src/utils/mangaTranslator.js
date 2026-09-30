@@ -13,7 +13,15 @@ let ocrWorker = null;
 export async function getOcrWorker(onProgress) {
   if (!ocrWorker) {
     if (onProgress) onProgress("OCR dvigateli yuklanmoqda...");
-    ocrWorker = await createWorker("eng");
+    try {
+      // Avval lokal serverdan (public/eng.traineddata) tezkor yuklash
+      ocrWorker = await createWorker("eng", 1, {
+        langPath: window.location.origin
+      });
+    } catch (e) {
+      console.warn("Lokal traineddata yuklanmadi, standart CDN ga o'tilmoqda:", e);
+      ocrWorker = await createWorker("eng");
+    }
   }
   return ocrWorker;
 }
