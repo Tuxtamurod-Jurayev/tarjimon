@@ -537,46 +537,75 @@ function cleanTextPixelsFromCanvas(ctx, lines, fallbackBg = "#FFFFFF") {
 }
 
 /**
- * zyddnys Typesetting & Balloon-Aware Rendering:
- * Tarjima qilingan matnni pufakcha shakliga (ellips/to'rtburchak) qarab markazlashtirib chizish.
+ * zyddnys 3-bosqich: Professional Manga Typesetting & Adaptive Shape-Aware Auto-Wrap
+ * Matnni pufakchaning geometrik shakliga (ellips yoki to'rtburchak) qarab
+ * satrlarga taqsimlash, optimal shrift o'lchamini hisoblash va halo effekti bilan chizish.
  */
 function renderDialogueText(ctx, text, bbox, balloonBbox, bgColor, textColor, preferredFontSize) {
-  // Pufakchaning haqiqiy chegarasi hisobga olinadi
   const bBox = balloonBbox || bbox;
-  const boxW = Math.max(28, Math.round(bBox.width * 0.88));
-  const boxH = Math.max(18, Math.round(bBox.height * 0.88));
+  const isDark = balloonBbox?.isDark || (textColor === "#FFFFFF" || textColor === "#FFE082");
+  const isRectangular = isDark || (bBox.width / bBox.height > 1.85);
+
+  const safeW = Math.max(30, Math.round(bBox.width * 0.88));
+  const safeH = Math.max(20, Math.round(bBox.height * 0.88));
+  const rx = safeW / 2;
+  const ry = safeH / 2;
   const centerX = bBox.x0 + bBox.width / 2;
   const centerY = bBox.y0 + bBox.height / 2;
 
   const words = text.split(/\s+/).filter(Boolean);
   if (words.length === 0) return;
 
-  // Optimal shrift o'lchamini hisoblash
-  let bestFontSize = Math.min(preferredFontSize || 16, Math.max(10, Math.round(boxH * 0.42)));
-  let bestLines = [];
+  // Boshlang'ich maksimal shrift o'lchami
+  const maxFs = Math.min(preferredFontSize || 30, Math.max(12, Math.round(safeH * 0.44)));
+  let bestFontSize = 8;
+  let bestLines = [text];
 
-  for (let fs = bestFontSize; fs >= 8; fs--) {
-    ctx.font = `bold ${fs}px 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif`;
+  // 1. Shrift o'lchamini optimal tanlash (Binary/Linear auto-fit search)
+  for (let fs = maxFs; fs >= 8; fs--) {
+    ctx.font = `bold ${fs}px 'Plus Jakarta Sans', 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif`;
+    const lineHeight = fs * 1.24;
+
+    // Taxminiy qatorlar sonini aniqlash
+    const rawTotalWidth = ctx.measureText(text).width;
+    const estLineCount = Math.max(1, Math.ceil(rawTotalWidth / safeW));
+
     const lines = [];
-    let currentLine = words[0];
+    let currentLine = "";
+    let lineIdx = 0;
     let fits = true;
 
-    for (let i = 1; i < words.length; i++) {
-      const test = currentLine + " " + words[i];
-      if (ctx.measureText(test).width <= boxW) {
-        currentLine = test;
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i];
+      const testLine = currentLine ? currentLine + " " + w : w;
+
+      // Elliptik yoki to'rtburchak pufakcha uchun o'sha satrdagi mavjud kenglik
+      let availW = safeW;
+      if (!isRectangular && estLineCount > 1) {
+        const dy = (lineIdx - (estLineCount - 1) / 2) * lineHeight;
+        const normY = Math.min(0.92, Math.abs(dy) / (ry || 1));
+        availW = 2 * rx * Math.sqrt(Math.max(0.2, 1 - normY * normY)) * 0.92;
+      }
+
+      if (ctx.measureText(testLine).width <= availW) {
+        currentLine = testLine;
       } else {
-        lines.push(currentLine);
-        currentLine = words[i];
-        if (ctx.measureText(currentLine).width > boxW + 4) {
+        if (currentLine) {
+          lines.push(currentLine);
+          lineIdx++;
+        }
+        currentLine = w;
+        if (ctx.measureText(w).width > safeW * 1.05) {
           fits = false;
+          break;
         }
       }
     }
     if (currentLine) lines.push(currentLine);
 
-    const totalHeight = lines.length * (fs * 1.25);
-    if (fits && totalHeight <= boxH + 4) {
+    // Qatorlar balandligi pufakcha ichiga sig'ishini tekshirish
+    const totalHeight = lines.length * lineHeight;
+    if (fits && totalHeight <= safeH + 4) {
       bestFontSize = fs;
       bestLines = lines;
       break;
@@ -584,28 +613,53 @@ function renderDialogueText(ctx, text, bbox, balloonBbox, bgColor, textColor, pr
     bestLines = lines;
   }
 
+  // 2. Yolg'iz so'z (Orphan/Widow) qolib ketishining oldini olish va balanslash
+  if (bestLines.length >= 2) {
+    const last = bestLines[bestLines.length - 1];
+    const prev = bestLines[bestLines.length - 2];
+    const lastWords = last.split(" ");
+    const prevWords = prev.split(" ");
+
+    // Agar oxirgi satrda faqat bitta qisqa so'z qolgan bo'lsa
+    if (lastWords.length === 1 && prevWords.length >= 2) {
+      const moved = prevWords.pop();
+      const newPrev = prevWords.join(" ");
+      const newLast = moved + " " + last;
+
+      ctx.font = `bold ${bestFontSize}px 'Plus Jakarta Sans', 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif`;
+      if (ctx.measureText(newLast).width <= safeW) {
+        bestLines[bestLines.length - 2] = newPrev;
+        bestLines[bestLines.length - 1] = newLast;
+      }
+    }
+  }
+
+  // 3. Canvasga professional manga lettering bilan chizish
   ctx.save();
-  ctx.font = `bold ${bestFontSize}px 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif`;
+  ctx.font = `bold ${bestFontSize}px 'Plus Jakarta Sans', 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
-  const lineHeight = bestFontSize * 1.25;
+  const lineHeight = bestFontSize * 1.24;
   const totalH = bestLines.length * lineHeight;
   const startY = centerY - totalH / 2 + lineHeight / 2;
 
-  // Har bir qatorni halo (stroke) va toza rang bilan chizish
+  // Nozik halo (chegara) kengligi
+  const strokeW = Math.max(2.5, Math.round(bestFontSize * 0.22));
+  ctx.lineWidth = strokeW;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
   for (let i = 0; i < bestLines.length; i++) {
     const lineStr = bestLines[i];
     const yPos = startY + i * lineHeight;
 
-    // Matn atrofiga nozik chegara (halo) - har qanday fonda tiniq o'qilishini ta'minlaydi
-    ctx.lineWidth = Math.max(2, Math.round(bestFontSize * 0.22));
-    ctx.lineJoin = "round";
+    // 1-bosqich: Halo kontur (fon rangida)
     ctx.strokeStyle = bgColor || "#FFFFFF";
     ctx.strokeText(lineStr, centerX, yPos);
 
-    // Asosiy matn
-    ctx.fillStyle = textColor || "#000000";
+    // 2-bosqich: Asosiy matn
+    ctx.fillStyle = textColor || (isDark ? "#FFFFFF" : "#0F172A");
     ctx.fillText(lineStr, centerX, yPos);
   }
 
