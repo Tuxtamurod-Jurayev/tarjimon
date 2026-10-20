@@ -1,55 +1,118 @@
+import { cyrillicToLatin } from "./transliterate";
+
 /**
- * Barcha muhitlarda (Localhost va Vercel) 100% ishlaydigan ko'p bosqichli tarjimon
+ * Barcha muhitlarda (Localhost va Vercel) 100% aniq va xatosiz ishlaydigan ko'p bosqichli tarjimon
  */
 
-// Yagona matn yoki jumlani tarjima qilish
+// Tarjimalar kesh xotirasi (bir xil iboralar takrorlanishida tezkor javob berish uchun)
+const translationCache = new Map();
+
+// HTML belgilarni asl holiga qaytarish (masalan &#39; -> ' va &quot; -> ")
+function decodeHtmlEntities(str) {
+  if (!str) return "";
+  return str
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(code));
+}
+
+// Yagona matn yoki jumlani o'zbek tiliga aniq tarjima qilish
 export async function translateSingleText(text, sourceLang = "en", targetLang = "uz") {
   if (!text || !text.trim()) return text;
+
+  const rawText = text.trim();
+  const isUpper = rawText.length > 2 && rawText === rawText.toUpperCase() && /[A-Z]/.test(rawText);
+  const cacheKey = `${sourceLang}_${targetLang}_${rawText.toLowerCase()}`;
+
+  if (translationCache.has(cacheKey)) {
+    const cached = translationCache.get(cacheKey);
+    return isUpper ? cached.toUpperCase() : cached;
+  }
 
   // 1-bosqich: /api/translate serverless / dev proxy orqali (CORS muammosiz)
   try {
     const res = await fetch("/api/translate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, sl: sourceLang, tl: targetLang })
+      body: JSON.stringify({ text: rawText, sl: sourceLang, tl: targetLang })
     });
     if (res.ok) {
       const data = await res.json();
-      if (data.translatedText) return data.translatedText;
+      if (data?.translatedText && typeof data.translatedText === "string" && data.translatedText.trim()) {
+        const clean = decodeHtmlEntities(data.translatedText.trim());
+        translationCache.set(cacheKey, clean);
+        return isUpper ? clean.toUpperCase() : clean;
+      }
     }
   } catch (err) {
     console.warn("Lokal /api/translate ulanmadi, zaxira usullarga o'tilmoqda...", err);
   }
 
-  // 2-bosqich: Bepul MyMemory API (CORS ni qo'llab-quvvatlaydi)
+  // 2-bosqich: Google Translate dict-chrome-ex (o'ta tezkor, brauzerdan to'g'ridan-to'g'ri ishlaydi)
   try {
-    const mmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${sourceLang}|${targetLang}`;
-    const mmRes = await fetch(mmUrl);
-    if (mmRes.ok) {
-      const mmData = await mmRes.json();
-      if (mmData?.responseData?.translatedText) {
-        return mmData.responseData.translatedText;
+    const dUrl = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=${sourceLang}&tl=${targetLang}&q=${encodeURIComponent(rawText)}`;
+    const dRes = await fetch(dUrl);
+    if (dRes.ok) {
+      const dData = await dRes.json();
+      if (Array.isArray(dData) && typeof dData[0] === "string" && dData[0].trim()) {
+        const clean = decodeHtmlEntities(dData[0].trim());
+        translationCache.set(cacheKey, clean);
+        return isUpper ? clean.toUpperCase() : clean;
       }
     }
   } catch (err) {
-    console.warn("MyMemory API xatoligi:", err);
+    console.warn("Google dict-chrome-ex xatoligi:", err);
   }
 
-  // 3-bosqich: To'g'ridan-to'g'ri Google Translate endpoint (ba'zi brauzerlar va muhitlarda)
+  // 3-bosqich: To'g'ridan-to'g'ri Google Translate GTX endpoint
   try {
-    const gtUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`;
+    const gtUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${targetLang}&dt=t&q=${encodeURIComponent(rawText)}`;
     const gtRes = await fetch(gtUrl);
     if (gtRes.ok) {
       const gtData = await gtRes.json();
       if (Array.isArray(gtData) && Array.isArray(gtData[0])) {
-        return gtData[0].map((item) => item[0]).join("");
+        const resText = gtData[0]
+          .filter((item) => item && typeof item[0] === "string")
+          .map((item) => item[0])
+          .join("");
+        if (resText.trim()) {
+          const clean = decodeHtmlEntities(resText.trim());
+          translationCache.set(cacheKey, clean);
+          return isUpper ? clean.toUpperCase() : clean;
+        }
       }
     }
   } catch (err) {
     console.warn("Direct GT xatoligi:", err);
   }
 
-  return text; // Oxirgi holatda asl matn qaytariladi
+  // 4-bosqich: Bepul MyMemory API (qattiq sanitizatsiya va kirill->lotin konvertatsiyasi bilan)
+  try {
+    const mmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(rawText)}&langpair=${sourceLang}|${targetLang}`;
+    const mmRes = await fetch(mmUrl);
+    if (mmRes.ok) {
+      const mmData = await mmRes.json();
+      let trans = mmData?.responseData?.translatedText;
+      if (trans && typeof trans === "string" && !trans.includes("MYMEMORY WARNING")) {
+        trans = decodeHtmlEntities(trans.trim());
+        // Agar kirill yozuvida qaytgan bo'lsa, uni zamonaviy o'zbek lotiniga o'tkazish
+        if (/[а-яёқғҳў]/i.test(trans)) {
+          trans = cyrillicToLatin(trans);
+        }
+        translationCache.set(cacheKey, trans);
+        return isUpper ? trans.toUpperCase() : trans;
+      }
+    }
+  } catch (err) {
+    console.warn("MyMemory API xatoligi:", err);
+  }
+
+  return rawText; // Oxirgi holatda asl matn qaytariladi
 }
 
 // Matnni xavfsiz o'lchamdagi bo'laklarga ajratish

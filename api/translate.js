@@ -34,6 +34,21 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Matn (text) kiritilmagan" });
     }
 
+    // 1-bosqich: Google Translate dict-chrome-ex (o'ta tezkor, aniq va barqaror)
+    try {
+      const dUrl = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=${sl}&tl=${tl}&q=${encodeURIComponent(text)}`;
+      const dRes = await fetch(dUrl);
+      if (dRes.ok) {
+        const dData = await dRes.json();
+        if (Array.isArray(dData) && typeof dData[0] === "string" && dData[0].trim()) {
+          return res.status(200).json({ translatedText: dData[0] });
+        }
+      }
+    } catch (e) {
+      console.warn("dict-chrome-ex xatosi, gtx ga o'tilmoqda:", e);
+    }
+
+    // 2-bosqich: Google Translate GTX
     const gtUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=${encodeURIComponent(
       text
     )}`;
@@ -47,7 +62,10 @@ export default async function handler(req, res) {
     let translatedText = "";
 
     if (Array.isArray(data) && Array.isArray(data[0])) {
-      translatedText = data[0].map((item) => item[0]).join("");
+      translatedText = data[0]
+        .filter((item) => item && typeof item[0] === "string")
+        .map((item) => item[0])
+        .join("");
     } else {
       throw new Error("Kutilmagan format");
     }

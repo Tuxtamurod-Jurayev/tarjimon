@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from "react";
 import {
+  Languages,
   BookOpen,
   Image as ImageIcon,
   Upload,
@@ -316,6 +317,7 @@ export default function App() {
 
     const newBlock = {
       id: "manual_" + Date.now(),
+      lines: [{ bbox: { x0, y0, x1, y1 }, text: defaultText }],
       text: defaultText,
       translatedText: defaultText,
       bbox: { x0, y0, x1, y1, width, height },
@@ -394,7 +396,7 @@ export default function App() {
       <nav className="top-nav">
         <div className="container top-nav-inner">
           <div className="logo">
-            <BookOpen size={22} />
+            <Languages size={22} />
             <span>Anime & Manga Tarjimoni (PDF / Rasm)</span>
           </div>
 
@@ -505,7 +507,7 @@ export default function App() {
         {/* Empty State */}
         {pages.length === 0 && (
           <div className="simple-dropzone card" onClick={() => fileInputRef.current?.click()}>
-            <BookOpen size={48} style={{ margin: "0 auto 0.8rem", color: "var(--text-muted)" }} />
+            <Languages size={48} style={{ margin: "0 auto 0.8rem", color: "var(--primary)" }} />
             <h3>Anime Kitob (PDF) yoki Manga Rasmini Yuklang</h3>
             <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginTop: "0.4rem", maxWidth: "600px", margin: "0.4rem auto 0" }}>
               PDF kitoblar yoki rasmlar ichidagi barcha dialog pufakchalari va "Main Quest" tizim oynalaridagi inglizcha so'zlar avtomatik aniqlanadi, asl chizmani o'zgartirmasdan o'zbek tiliga tarjima qilinadi.

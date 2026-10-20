@@ -49,10 +49,30 @@ export default defineConfig({
               return;
             }
 
+            // 1-bosqich: dict-chrome-ex (tezkor va aniq)
+            try {
+              const dUrl = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=${sl}&tl=${tl}&q=${encodeURIComponent(text)}`;
+              const dRes = await fetch(dUrl);
+              if (dRes.ok) {
+                const dData = await dRes.json();
+                if (Array.isArray(dData) && typeof dData[0] === 'string' && dData[0].trim()) {
+                  res.statusCode = 200;
+                  res.setHeader('Content-Type', 'application/json');
+                  res.end(JSON.stringify({ translatedText: dData[0] }));
+                  return;
+                }
+              }
+            } catch {
+              // fallback
+            }
+
+            // 2-bosqich: gtx
             const gtUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=${encodeURIComponent(text)}`;
             const response = await fetch(gtUrl);
             const data = await response.json();
-            const translatedText = data[0].map(item => item[0]).join('');
+            const translatedText = Array.isArray(data) && Array.isArray(data[0])
+              ? data[0].filter(item => item && typeof item[0] === 'string').map(item => item[0]).join('')
+              : '';
 
             res.statusCode = 200;
             res.setHeader('Content-Type', 'application/json');
