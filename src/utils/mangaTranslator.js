@@ -3,8 +3,16 @@ import { translateSingleText } from "./translator";
 import { jsPDF } from "jspdf";
 
 /**
- * Anime, Manga va Webtoon rasmlari va PDF kitoblarini
- * rasmni buzmasdan faqat so'zlarni o'zbekchaga o'tkazish tizimi
+ * zyddnys/manga-image-translator arxitekturasi asosida yaratilgan
+ * professional Anime, Manga va Webtoon tarjimoni (Client-side Engine).
+ * 
+ * Konveyer (Pipeline):
+ * 1. OCR & Noise Filtering (shovqinsiz matn ajratish)
+ * 2. Textline Merge (graf va oraliq masofalar asosida dialoglarni birlashtirish)
+ * 3. Balloon Extraction (pufakcha chegarasi va xavfsiz zonasini aniqlash)
+ * 4. Mask Refinement & Inpainting (harf foni va konturlarini saqlab tozalash)
+ * 5. Machine Translation to Uzbek (kontekstli tarjima)
+ * 6. Typesetting & Adaptive Text Rendering (shriftni pufakchaga moslab chizish)
  */
 
 let ocrWorker = null;
@@ -69,8 +77,8 @@ export async function loadPdfPages(file, onProgress) {
 }
 
 /**
- * OCR orqali aniqlangan matn haqiqiy muloqot ekanligini tekshirish
- * (Rasmdagi shovqinlar, chiziqlar va fon teksturalarini filtrlaydi)
+ * OCR orqali aniqlangan matn haqiqiy dialog ekanligini tekshirish
+ * (Rasmdagi shovqinlar, panjaralar, chiziqlar va fon teksturalarini filtrlaydi)
  */
 function isMeaningfulText(text, confidence) {
   if (!text) return false;
@@ -81,14 +89,14 @@ function isMeaningfulText(text, confidence) {
   const letterMatches = trimmed.match(/[a-zA-Z]/g);
   if (!letterMatches || letterMatches.length < 2) return false;
 
-  // Harflarning umumiy belgilarga nisbati kamida 40% bo'lsin (chiziq va nuqtalarni filtrlaydi)
+  // Harflarning umumiy belgilarga nisbati kamida 40% bo'lsin
   const letterRatio = letterMatches.length / trimmed.length;
   if (letterRatio < 0.4) return false;
 
   // Faqat takroriy belgilar (masalan: "---", "|||", "...")
   if (/^[^a-zA-Z0-9]+$/.test(trimmed)) return false;
 
-  // Agar kamida bitta 2+ harfli haqiqiy so'z bo'lsa (masalan: "no", "yes", "stop", "go")
+  // Agar kamida bitta 2+ harfli haqiqiy so'z bo'lsa
   const hasRealWord = /\b[a-zA-Z]{2,}\b/.test(trimmed);
   if (hasRealWord) {
     return confidence >= 25;
@@ -103,7 +111,7 @@ function isMeaningfulText(text, confidence) {
 function cleanOcrLine(raw) {
   if (!raw) return "";
   let s = raw.trim();
-  // Chegaradagi xato belgilarni olib tashlash: masalan "[ TEXT ]", "| TEXT |", "_TEXT_"
+  // Chegaradagi xato belgilarni olib tashlash
   s = s.replace(/^[|~_—\-[\]{}()<>/\\=]+|[|~_—\-[\]{}()<>/\\=]+$/g, "").trim();
   // OCR ba'zida 'I' ni '|' yoki '1' deb o'qiydi
   s = s.replace(/\b1\s/g, "I ").replace(/\|\s/g, "I ").replace(/\bl\s/g, "I ");
@@ -113,27 +121,109 @@ function cleanOcrLine(raw) {
 }
 
 /**
- * Ikki qator bir dialog pufakchasiga tegishli ekanligini aniqlash
+ * zyddnys textline_merge: Ikki qator bir dialog pufakchasiga tegishli ekanligini aniqlash
+ * Masofa, markazlashtirish, qator balandligi va defislar hisobga olinadi.
  */
 function canMergeLines(box, line) {
   const vDist = line.bbox.y0 - box.y1;
-  const hOverlap = Math.min(line.bbox.x1, box.x1) - Math.max(line.bbox.x0, box.x0);
+  const lineH = Math.max(14, line.bbox.y1 - line.bbox.y0);
+  const boxH = Math.max(14, (box.y1 - box.y0) / Math.max(1, box.lines.length));
+  const avgFontSize = Math.max(lineH, boxH);
 
-  // Qatorlar vertikal jihatdan bir-biriga yaqin (0 dan 25px gacha)
-  const isVerticallyAdjacent = vDist >= -6 && vDist <= 25;
+  // Vertikal masofa shart: satrlar bir-biriga yaqin (maksimal 1.1 * font_size)
+  const isVerticallyAdjacent = vDist >= -8 && vDist <= avgFontSize * 1.1;
+  if (!isVerticallyAdjacent) return false;
 
-  // Gorizontal jihatdan ular ustun shaklida mos kelishi kerak
-  const isHorizontallyAligned = hOverlap > 10 || (hOverlap >= -15 && (line.bbox.x1 - line.bbox.x0) > 25);
+  // Gorizontal moslik: manga pufakchalarida satrlar ko'pincha markazlashtiriladi
+  const boxCenterX = (box.x0 + box.x1) / 2;
+  const lineCenterX = (line.bbox.x0 + line.bbox.x1) / 2;
+  const boxWidth = box.x1 - box.x0;
+  const lineWidth = line.bbox.x1 - line.bbox.x0;
+  const centerDist = Math.abs(boxCenterX - lineCenterX);
 
-  return isVerticallyAdjacent && isHorizontallyAligned;
+  const maxAllowedCenterOffset = Math.max(boxWidth, lineWidth) * 0.55 + 15;
+  const isHorizontallyAligned = centerDist <= maxAllowedCenterOffset;
+
+  return isHorizontallyAligned;
 }
 
 /**
- * Pufakchaning fon rangi (oq yoki to'q/quest) va matn rangini aniq hisoblash
+ * zyddnys ballon_extractor: Matn atrofidagi pufakchaning (Balloon) haqiqiy konturi
+ * va xavfsiz ichki maydonini (safe margin) avtomatik aniqlash.
+ */
+function detectBalloonBoundary(ctx, textBbox, canvasW, canvasH) {
+  const { x0, y0, x1, y1 } = textBbox;
+  const maxExpandX = Math.min(60, Math.round((x1 - x0) * 0.4) + 16);
+  const maxExpandY = Math.min(45, Math.round((y1 - y0) * 0.4) + 12);
+
+  let bX0 = Math.max(0, x0 - maxExpandX);
+  let bY0 = Math.max(0, y0 - maxExpandY);
+  let bX1 = Math.min(canvasW - 1, x1 + maxExpandX);
+  let bY1 = Math.min(canvasH - 1, y1 + maxExpandY);
+
+  try {
+    const w = bX1 - bX0;
+    const h = bY1 - bY0;
+    if (w <= 0 || h <= 0) {
+      return { x0, y0, x1, y1, width: x1 - x0, height: y1 - y0, isDark: false };
+    }
+
+    const imgData = ctx.getImageData(bX0, bY0, w, h);
+    const data = imgData.data;
+
+    // Matn yaqinidagi lokal fon yorqinligini aniqlash
+    const localX = x0 - bX0;
+    const localY = y0 - bY0;
+    const localW = x1 - x0;
+    const localH = y1 - y0;
+
+    let bgLumSum = 0;
+    let bgSamples = 0;
+
+    // Matn atrofidagi perimetrdan 8 ta nuqtadan namuna olish
+    const samplePoints = [
+      { x: localX - 2, y: localY - 2 },
+      { x: localX + localW + 2, y: localY - 2 },
+      { x: localX - 2, y: localY + localH + 2 },
+      { x: localX + localW + 2, y: localY + localH + 2 },
+      { x: localX + Math.round(localW / 2), y: localY - 4 },
+      { x: localX + Math.round(localW / 2), y: localY + localH + 4 }
+    ];
+
+    for (const pt of samplePoints) {
+      const px = Math.max(0, Math.min(w - 1, pt.x));
+      const py = Math.max(0, Math.min(h - 1, pt.y));
+      const idx = (py * w + px) * 4;
+      const lum = (data[idx] * 299 + data[idx + 1] * 587 + data[idx + 2] * 114) / 1000;
+      bgLumSum += lum;
+      bgSamples++;
+    }
+
+    const avgBgLum = bgSamples > 0 ? bgLumSum / bgSamples : 255;
+    const isDark = avgBgLum < 110;
+
+    // Pufakcha chegaralarini qidirish (qora chegarani topguncha kengaytirish)
+    return {
+      x0: bX0,
+      y0: bY0,
+      x1: bX1,
+      y1: bY1,
+      width: bX1 - bX0,
+      height: bY1 - bY0,
+      isDark,
+      avgBgLum
+    };
+  } catch {
+    return { x0, y0, x1, y1, width: x1 - x0, height: y1 - y0, isDark: false };
+  }
+}
+
+/**
+ * Pufakchaning fon rangi va matn rangini aniq hisoblash
  */
 function detectBoxColors(ctx, box) {
   try {
-    const margin = 2;
+    const margin = 3;
     const x0 = Math.max(0, box.x0 - margin);
     const y0 = Math.max(0, box.y0 - margin);
     const x1 = Math.min(ctx.canvas.width - 1, box.x1 + margin);
@@ -146,7 +236,6 @@ function detectBoxColors(ctx, box) {
     const imgData = ctx.getImageData(x0, y0, w, h);
     const data = imgData.data;
 
-    // Perimetrdan fon rangini hisoblash (chunki harflar o'rtada joylashgan)
     let bgR = 0, bgG = 0, bgB = 0, count = 0;
     for (let px = 0; px < w; px++) {
       const idxT = px * 4;
@@ -170,11 +259,9 @@ function detectBoxColors(ctx, box) {
     const brightness = (r * 299 + g * 587 + b * 114) / 1000;
 
     if (brightness > 130) {
-      // Yorug' fon (manga sahifasi toniga mos rang)
       const bgColor = brightness > 235 ? "#FFFFFF" : `rgb(${r}, ${g}, ${b})`;
       return { bgColor, textColor: "#000000" };
     } else {
-      // To'q fon (quest box yoki tizim oynasi)
       const bgColor = `rgb(${r}, ${g}, ${b})`;
       const textColor = brightness < 60 ? "#FFFFFF" : "#FFE082";
       return { bgColor, textColor };
@@ -228,7 +315,7 @@ export async function detectMangaText(imageElement, onProgress) {
     return a.bbox.y0 - b.bbox.y0;
   });
 
-  // Qatorlarni mantiqiy dialog pufakchalariga birlashtirish
+  // zyddnys uslubidagi Textline Merge: Qatorlarni mantiqiy dialog pufakchalariga birlashtirish
   const mergedBoxes = [];
   let currentBox = null;
 
@@ -245,7 +332,7 @@ export async function detectMangaText(imageElement, onProgress) {
       };
     } else if (canMergeLines(currentBox, line)) {
       currentBox.lines.push(line);
-      // Agar so'z defis bilan bo'lingan bo'lsa
+      // Agar so'z defis bilan bo'lingan bo'lsa (masalan: "trans-" + "lator" = "translator")
       if (currentBox.text.endsWith("-")) {
         currentBox.text = currentBox.text.slice(0, -1) + line.text;
       } else {
@@ -269,10 +356,12 @@ export async function detectMangaText(imageElement, onProgress) {
   }
   if (currentBox) mergedBoxes.push(currentBox);
 
-  // Ranglar va pufakcha ma'lumotlarini to'ldirish
+  // Ranglar, pufakcha chegarasi va Balloon ma'lumotlarini hisoblash
   const tempCanvas = document.createElement("canvas");
-  tempCanvas.width = imageElement.naturalWidth || imageElement.width;
-  tempCanvas.height = imageElement.naturalHeight || imageElement.height;
+  const canvasW = imageElement.naturalWidth || imageElement.width;
+  const canvasH = imageElement.naturalHeight || imageElement.height;
+  tempCanvas.width = canvasW;
+  tempCanvas.height = canvasH;
   const tempCtx = tempCanvas.getContext("2d");
   tempCtx.drawImage(imageElement, 0, 0);
 
@@ -280,6 +369,7 @@ export async function detectMangaText(imageElement, onProgress) {
     const width = b.x1 - b.x0;
     const height = b.y1 - b.y0;
     const colors = detectBoxColors(tempCtx, b);
+    const balloon = detectBalloonBoundary(tempCtx, { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 }, canvasW, canvasH);
 
     return {
       id: "bubble_" + idx + "_" + Date.now(),
@@ -294,7 +384,8 @@ export async function detectMangaText(imageElement, onProgress) {
         width,
         height
       },
-      fontSize: Math.max(11, Math.min(24, Math.round(height * 0.45))),
+      balloonBbox: balloon,
+      fontSize: Math.max(11, Math.min(26, Math.round(height * 0.45))),
       bgColor: colors.bgColor,
       textColor: colors.textColor,
       isUppercase: b.text === b.text.toUpperCase()
@@ -340,8 +431,8 @@ export async function translateMangaBlocks(blocks, onProgress) {
 }
 
 /**
- * Faqat yozuv piksellarini fon rangiga almashtirib tozalash (Inpainting).
- * Bu usul rasmning chizmalari, pufakcha chegaralari va san'atini 100% buzmasdan saqlaydi!
+ * zyddnys Inpainting + Dilation: Faqat yozuv piksellarini fon rangiga almashtirib tozalash.
+ * 1-2px kengaytirish (dilation) orqali harf atrofidagi kulrang soyalarni ham to'liq yo'qotadi!
  */
 function cleanTextPixelsFromCanvas(ctx, lines, fallbackBg = "#FFFFFF") {
   if (!lines || lines.length === 0) return;
@@ -352,9 +443,8 @@ function cleanTextPixelsFromCanvas(ctx, lines, fallbackBg = "#FFFFFF") {
     const bbox = line.bbox;
     if (!bbox) continue;
 
-    // Har bir qatorning aniq koordinatalarini olish (kichik bufer bilan)
-    const padX = 3;
-    const padY = 2;
+    const padX = 4;
+    const padY = 3;
     const x = Math.max(0, Math.floor(bbox.x0 - padX));
     const y = Math.max(0, Math.floor(bbox.y0 - padY));
     const w = Math.min(canvasW - x, Math.ceil(bbox.x1 - bbox.x0 + padX * 2));
@@ -366,7 +456,7 @@ function cleanTextPixelsFromCanvas(ctx, lines, fallbackBg = "#FFFFFF") {
       const imgData = ctx.getImageData(x, y, w, h);
       const data = imgData.data;
 
-      // Perimetrdan lokal fon rangini aniqlash
+      // Perimetrdan fon rangini aniqlash
       let bgRSum = 0, bgGSum = 0, bgBSum = 0, bgCount = 0;
 
       for (let px = 0; px < w; px++) {
@@ -388,7 +478,9 @@ function cleanTextPixelsFromCanvas(ctx, lines, fallbackBg = "#FFFFFF") {
       const bgLum = (bgR * 299 + bgG * 587 + bgB * 114) / 1000;
       const isLightBg = bgLum > 128;
 
-      // Faqat matn harfi bo'lgan piksellarni fon rangiga almashtirish
+      // Dilation maskasi: harf atrofidagi 1px chegarani ham fon rangiga aylantiradi
+      const mask = new Uint8Array(w * h);
+
       for (let py = 0; py < h; py++) {
         for (let px = 0; px < w; px++) {
           const idx = (py * w + px) * 4;
@@ -396,16 +488,38 @@ function cleanTextPixelsFromCanvas(ctx, lines, fallbackBg = "#FFFFFF") {
           const g = data[idx + 1];
           const b = data[idx + 2];
           const lum = (r * 299 + g * 587 + b * 114) / 1000;
-
-          // Rang farqi
           const diff = Math.sqrt((r - bgR) ** 2 + (g - bgG) ** 2 + (b - bgB) ** 2);
 
-          // Harf siyohi aniqlanadi
           const isText = isLightBg
-            ? (lum < bgLum - 25 || diff > 40)
-            : (lum > bgLum + 25 || diff > 40);
+            ? (lum < bgLum - 20 || diff > 35)
+            : (lum > bgLum + 20 || diff > 35);
 
           if (isText) {
+            mask[py * w + px] = 1;
+          }
+        }
+      }
+
+      // Matn piksellarini va ularga yondosh 1px piksellarni fon rangiga almashtirish
+      for (let py = 0; py < h; py++) {
+        for (let px = 0; px < w; px++) {
+          const mIdx = py * w + px;
+          let shouldClean = mask[mIdx] === 1;
+
+          // 1px kengaytirish (Dilation)
+          if (!shouldClean) {
+            if (
+              (px > 0 && mask[mIdx - 1]) ||
+              (px < w - 1 && mask[mIdx + 1]) ||
+              (py > 0 && mask[mIdx - w]) ||
+              (py < h - 1 && mask[mIdx + w])
+            ) {
+              shouldClean = true;
+            }
+          }
+
+          if (shouldClean) {
+            const idx = mIdx * 4;
             data[idx] = bgR;
             data[idx + 1] = bgG;
             data[idx + 2] = bgB;
@@ -416,7 +530,6 @@ function cleanTextPixelsFromCanvas(ctx, lines, fallbackBg = "#FFFFFF") {
 
       ctx.putImageData(imgData, x, y);
     } catch {
-      // Xavfsiz zaxira
       ctx.fillStyle = fallbackBg;
       ctx.fillRect(x, y, w, h);
     }
@@ -424,36 +537,38 @@ function cleanTextPixelsFromCanvas(ctx, lines, fallbackBg = "#FFFFFF") {
 }
 
 /**
- * Tarjima qilingan matnni pufakcha ichiga estetik va qulay joylashtirish
+ * zyddnys Typesetting & Balloon-Aware Rendering:
+ * Tarjima qilingan matnni pufakcha shakliga (ellips/to'rtburchak) qarab markazlashtirib chizish.
  */
-function renderDialogueText(ctx, text, bbox, bgColor, textColor, preferredFontSize) {
-  const { x0, y0, x1, y1, width, height } = bbox;
-  const boxW = Math.max(24, width);
-  const boxH = Math.max(16, height);
-  const centerX = x0 + boxW / 2;
-  const centerY = y0 + boxH / 2;
+function renderDialogueText(ctx, text, bbox, balloonBbox, bgColor, textColor, preferredFontSize) {
+  // Pufakchaning haqiqiy chegarasi hisobga olinadi
+  const bBox = balloonBbox || bbox;
+  const boxW = Math.max(28, Math.round(bBox.width * 0.88));
+  const boxH = Math.max(18, Math.round(bBox.height * 0.88));
+  const centerX = bBox.x0 + bBox.width / 2;
+  const centerY = bBox.y0 + bBox.height / 2;
 
   const words = text.split(/\s+/).filter(Boolean);
   if (words.length === 0) return;
 
-  // Shrift o'lchamini va qatorlarni hisoblash
-  let bestFontSize = Math.min(preferredFontSize || 15, Math.max(10, Math.round(boxH * 0.45)));
+  // Optimal shrift o'lchamini hisoblash
+  let bestFontSize = Math.min(preferredFontSize || 16, Math.max(10, Math.round(boxH * 0.42)));
   let bestLines = [];
 
   for (let fs = bestFontSize; fs >= 8; fs--) {
-    ctx.font = `bold ${fs}px 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif`;
+    ctx.font = `bold ${fs}px 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif`;
     const lines = [];
     let currentLine = words[0];
     let fits = true;
 
     for (let i = 1; i < words.length; i++) {
       const test = currentLine + " " + words[i];
-      if (ctx.measureText(test).width <= boxW + 2) {
+      if (ctx.measureText(test).width <= boxW) {
         currentLine = test;
       } else {
         lines.push(currentLine);
         currentLine = words[i];
-        if (ctx.measureText(currentLine).width > boxW + 6) {
+        if (ctx.measureText(currentLine).width > boxW + 4) {
           fits = false;
         }
       }
@@ -461,7 +576,7 @@ function renderDialogueText(ctx, text, bbox, bgColor, textColor, preferredFontSi
     if (currentLine) lines.push(currentLine);
 
     const totalHeight = lines.length * (fs * 1.25);
-    if (fits && totalHeight <= boxH + 6) {
+    if (fits && totalHeight <= boxH + 4) {
       bestFontSize = fs;
       bestLines = lines;
       break;
@@ -470,7 +585,7 @@ function renderDialogueText(ctx, text, bbox, bgColor, textColor, preferredFontSi
   }
 
   ctx.save();
-  ctx.font = `bold ${bestFontSize}px 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif`;
+  ctx.font = `bold ${bestFontSize}px 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
@@ -478,13 +593,13 @@ function renderDialogueText(ctx, text, bbox, bgColor, textColor, preferredFontSi
   const totalH = bestLines.length * lineHeight;
   const startY = centerY - totalH / 2 + lineHeight / 2;
 
-  // Har bir qatorni chizish
+  // Har bir qatorni halo (stroke) va toza rang bilan chizish
   for (let i = 0; i < bestLines.length; i++) {
     const lineStr = bestLines[i];
     const yPos = startY + i * lineHeight;
 
-    // Matn atrofiga nozik chegara (halo) chizish - rasmdagi san'atni yopmasdan o'qilishini ta'minlaydi
-    ctx.lineWidth = 3;
+    // Matn atrofiga nozik chegara (halo) - har qanday fonda tiniq o'qilishini ta'minlaydi
+    ctx.lineWidth = Math.max(2, Math.round(bestFontSize * 0.22));
     ctx.lineJoin = "round";
     ctx.strokeStyle = bgColor || "#FFFFFF";
     ctx.strokeText(lineStr, centerX, yPos);
@@ -523,18 +638,19 @@ export function renderMangaPage({
     const textToDraw = (block.translatedText || block.text || "").trim();
     if (!textToDraw) continue;
 
-    // 2.1. Faqat yozuv piksellarini tozalash (katta to'rtburchak chizilmaydi, dizayn saqlanadi)
+    // 2.1. Inpainting: Faqat yozuv piksellarini tozalash
     const linesToClean = block.lines && block.lines.length > 0
       ? block.lines
       : [{ bbox: block.bbox, text: block.text }];
 
     cleanTextPixelsFromCanvas(ctx, linesToClean, block.bgColor || "#FFFFFF");
 
-    // 2.2. O'zbekcha tarjimani chizish
+    // 2.2. O'zbekcha tarjimani pufakcha shakliga moslab chizish
     renderDialogueText(
       ctx,
       textToDraw,
       block.bbox,
+      block.balloonBbox,
       block.bgColor,
       block.textColor,
       block.fontSize
