@@ -36,6 +36,7 @@ export async function getOcrWorker(onProgress) {
 
 /**
  * PDF kitobni sahifama-sahifa yuqori sifatli rasmlarga aylantirish
+ * va mavjud raqamli matnlarni (embedded text layer) ham aniqlash
  */
 export async function loadPdfPages(file, onProgress) {
   if (!window.pdfjsLib) {
@@ -51,7 +52,7 @@ export async function loadPdfPages(file, onProgress) {
 
   for (let i = 1; i <= numPages; i++) {
     if (onProgress) {
-      onProgress(`Anime kitobi sahifalari tayyorlanmoqda: ${i}/${numPages}...`);
+      onProgress(`PDF sahifalari tayyorlanmoqda: ${i}/${numPages}...`);
     }
 
     const page = await pdf.getPage(i);
@@ -65,11 +66,51 @@ export async function loadPdfPages(file, onProgress) {
 
     await page.render({ canvasContext: ctx, viewport }).promise;
 
+    // Sahifadagi mavjud raqamli matnlarni (embedded text layer) tekshirish
+    let embeddedItems = [];
+    try {
+      const textContent = await page.getTextContent();
+      if (textContent?.items?.length > 0) {
+        for (const it of textContent.items) {
+          const str = (it.str || "").trim();
+          if (!str) continue;
+
+          const tx = it.transform[4];
+          const ty = it.transform[5];
+          const [vx, vy] = viewport.convertToViewportPoint(tx, ty);
+
+          const fontHeight = Math.max(10, (Math.hypot(it.transform[0], it.transform[1]) || it.height || 12) * viewport.scale);
+          const width = Math.max(8, (it.width || str.length * 7) * viewport.scale);
+
+          const x0 = Math.round(vx);
+          const y0 = Math.round(vy - fontHeight);
+          const x1 = Math.round(x0 + width);
+          const y1 = Math.round(vy + fontHeight * 0.15);
+
+          embeddedItems.push({
+            text: str,
+            confidence: 99,
+            bbox: {
+              x0,
+              y0,
+              x1,
+              y1,
+              width: x1 - x0,
+              height: y1 - y0
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.warn("Embedded text extraction:", e);
+    }
+
     pages.push({
       pageNumber: i,
       dataUrl: canvas.toDataURL("image/jpeg", 0.95),
       width: viewport.width,
-      height: viewport.height
+      height: viewport.height,
+      embeddedItems: embeddedItems.length > 0 ? embeddedItems : null
     });
   }
 
@@ -272,31 +313,96 @@ function detectBoxColors(ctx, box) {
 }
 
 /**
- * Rasmdagi inglizcha matnlarni OCR orqali aniqlash va dialog pufakchalariga birlashtirish
+ * PDF dagi alohida so'zlarni bitta satrga birlashtirish
  */
-export async function detectMangaText(imageElement, onProgress) {
-  if (onProgress) onProgress("Anime sahifasidagi matnlar skanerlanmoqda (OCR)...");
+function mergePdfTextItems(items) {
+  if (!items || items.length === 0) return [];
+  const sorted = [...items].sort((a, b) => {
+    if (Math.abs(a.bbox.y0 - b.bbox.y0) < 10) {
+      return a.bbox.x0 - b.bbox.x0;
+    }
+    return a.bbox.y0 - b.bbox.y0;
+  });
 
-  const worker = await getOcrWorker();
+  const lines = [];
+  let cur = null;
 
-  // Tesseract bboxes olish
-  const ret = await worker.recognize(imageElement, {}, { blocks: true, text: true });
+  for (const it of sorted) {
+    if (!cur) {
+      cur = {
+        text: it.text,
+        confidence: 99,
+        bbox: { ...it.bbox }
+      };
+    } else {
+      const sameLine = Math.abs(cur.bbox.y0 - it.bbox.y0) < 12;
+      const xDist = it.bbox.x0 - cur.bbox.x1;
+      // Agar bitta qatorda va bir-biriga yaqin bo'lsa
+      if (sameLine && xDist >= -5 && xDist <= 40) {
+        cur.text += (xDist > 2 ? " " : "") + it.text;
+        cur.bbox.x1 = Math.max(cur.bbox.x1, it.bbox.x1);
+        cur.bbox.y1 = Math.max(cur.bbox.y1, it.bbox.y1);
+        cur.bbox.width = cur.bbox.x1 - cur.bbox.x0;
+        cur.bbox.height = cur.bbox.y1 - cur.bbox.y0;
+      } else {
+        lines.push(cur);
+        cur = {
+          text: it.text,
+          confidence: 99,
+          bbox: { ...it.bbox }
+        };
+      }
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
 
-  const extractedLines = [];
+/**
+ * Rasmdagi inglizcha matnlarni aniqlash (Embedded text yoki Tesseract OCR orqali)
+ */
+export async function detectMangaText(imageElement, onProgress, embeddedItems = null) {
+  let extractedLines = [];
 
-  if (ret.data && ret.data.blocks) {
-    for (const block of ret.data.blocks) {
-      if (!block.paragraphs) continue;
-      for (const p of block.paragraphs) {
-        if (!p.lines) continue;
-        for (const l of p.lines) {
-          const cleanText = cleanOcrLine(l.text || "");
-          if (isMeaningfulText(cleanText, l.confidence)) {
-            extractedLines.push({
-              text: cleanText,
-              confidence: l.confidence,
-              bbox: l.bbox
-            });
+  // 1. Agar PDF dan olingan raqamli matnlar bo'lsa (o'ta tezkor va 100% aniq)
+  if (embeddedItems && embeddedItems.length > 0) {
+    if (onProgress) onProgress("Sahifadagi matnlar tahlil qilinmoqda...");
+    const mergedLines = mergePdfTextItems(embeddedItems);
+    for (const l of mergedLines) {
+      const clean = cleanOcrLine(l.text);
+      if (isMeaningfulText(clean, l.confidence)) {
+        extractedLines.push({
+          text: clean,
+          confidence: l.confidence,
+          bbox: l.bbox
+        });
+      }
+    }
+  }
+
+  // 2. Agar PDF da raqamli matn bo'lmasa (skanerlangan rasm / komiks), Tesseract OCR orqali skanerlash
+  if (extractedLines.length === 0) {
+    if (onProgress) onProgress("Sahifadagi matnlar skanerlanmoqda (OCR)...");
+
+    const worker = await getOcrWorker();
+
+    // Tesseract bboxes olish
+    const ret = await worker.recognize(imageElement, {}, { blocks: true, text: true });
+
+    if (ret.data && ret.data.blocks) {
+      for (const block of ret.data.blocks) {
+        if (!block.paragraphs) continue;
+        for (const p of block.paragraphs) {
+          if (!p.lines) continue;
+          for (const l of p.lines) {
+            const cleanText = cleanOcrLine(l.text || "");
+            if (isMeaningfulText(cleanText, l.confidence)) {
+              extractedLines.push({
+                text: cleanText,
+                confidence: l.confidence,
+                bbox: l.bbox
+              });
+            }
           }
         }
       }

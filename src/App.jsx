@@ -36,9 +36,11 @@ export default function App() {
   // Status & Progress
   const [isProcessing, setIsProcessing] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
+  const [progressPercent, setProgressPercent] = useState(0);
   const [showOriginal, setShowOriginal] = useState(false);
   const [isSelectingBox, setIsSelectingBox] = useState(false);
   const [selectionStart, setSelectionStart] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
 
   // Toast
   const [toast, setToast] = useState(null);
@@ -53,6 +55,29 @@ export default function App() {
     localStorage.setItem("tarjima_theme", theme);
   }, [theme]);
 
+  // Global Drag & Drop: brauzer PDF ni tashqi fayl sifatida ochib yuborishini oldini olish
+  useEffect(() => {
+    const handleDragOver = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const handleDrop = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragging(false);
+      if (e.dataTransfer?.files?.[0]) {
+        handleFileUpload(e.dataTransfer.files[0]);
+      }
+    };
+
+    window.addEventListener("dragover", handleDragOver);
+    window.addEventListener("drop", handleDrop);
+    return () => {
+      window.removeEventListener("dragover", handleDragOver);
+      window.removeEventListener("drop", handleDrop);
+    };
+  }, []);
+
   const showToast = (msg) => {
     setToast(msg);
     setTimeout(() => setToast(null), 3200);
@@ -60,7 +85,73 @@ export default function App() {
 
   const currentPage = pages[currentPageIndex] || null;
 
-  // 1. Faylni yuklash (PDF yoki Rasm)
+  // Barcha sahifalarni avtomatik ketma-ket tarjima qilish (Background Auto-Translator)
+  const autoTranslatePages = async (pagesList) => {
+    if (!pagesList || pagesList.length === 0) return;
+
+    setIsProcessing(true);
+    setProgressPercent(0);
+    const updatedPages = [...pagesList];
+
+    try {
+      for (let i = 0; i < updatedPages.length; i++) {
+        const p = updatedPages[i];
+        setCurrentPageIndex(i); // Foydalanuvchiga hozir qaysi sahifa tarjima bo'layotganini ko'rsatish
+        const percent = Math.round(((i + 1) / updatedPages.length) * 100);
+        setProgressPercent(percent);
+
+        setStatusMessage(`Sahifa ${i + 1}/${updatedPages.length}: Matnlar aniqlanmoqda...`);
+
+        const img = new Image();
+        await new Promise((res, rej) => {
+          img.onload = res;
+          img.onerror = rej;
+          img.src = p.dataUrl;
+        });
+
+        // 1. Matnlarni aniqlash (Raqamli PDF bo'lsa embeddedItems, rasm bo'lsa OCR)
+        const detected = await detectMangaText(
+          img,
+          (msg) => setStatusMessage(`Sahifa ${i + 1}/${updatedPages.length}: ${msg}`),
+          p.embeddedItems
+        );
+
+        if (detected.length > 0) {
+          setStatusMessage(`Sahifa ${i + 1}/${updatedPages.length}: ${detected.length} ta matn o'zbek tiliga o'girilmoqda...`);
+          const translated = await translateMangaBlocks(
+            detected,
+            (msg) => setStatusMessage(`Sahifa ${i + 1}/${updatedPages.length}: ${msg}`)
+          );
+
+          updatedPages[i] = {
+            ...p,
+            blocks: translated,
+            isTranslated: true
+          };
+
+          // Har bir sahifa tayyor bo'lishi bilan Canvas darhol yangilanadi
+          setPages([...updatedPages]);
+        } else {
+          updatedPages[i] = {
+            ...p,
+            isTranslated: true
+          };
+          setPages([...updatedPages]);
+        }
+      }
+
+      showToast("Barcha sahifalar to'liq o'zbek tiliga tarjima qilindi!");
+    } catch (err) {
+      console.error(err);
+      showToast("Tarjimada xatolik: " + err.message);
+    } finally {
+      setIsProcessing(false);
+      setStatusMessage("");
+      setProgressPercent(100);
+    }
+  };
+
+  // 1. Faylni yuklash (PDF yoki Rasm) va darhol avtomatik tarjima qilish
   const handleFileUpload = async (file) => {
     if (!file) return;
 
@@ -68,48 +159,62 @@ export default function App() {
     setPages([]);
     setCurrentPageIndex(0);
     setIsProcessing(true);
+    setProgressPercent(5);
 
     try {
       const ext = file.name.substring(file.name.lastIndexOf(".")).toLowerCase();
+      let initializedPages = [];
 
       if (ext === ".pdf") {
-        setStatusMessage("Anime PDF sahifalari yuklanmoqda...");
+        setStatusMessage("PDF sahifalari tayyorlanmoqda...");
         const pdfPages = await loadPdfPages(file, (msg) => setStatusMessage(msg));
-        const initializedPages = pdfPages.map((p) => ({
+        initializedPages = pdfPages.map((p) => ({
           ...p,
           blocks: [],
           isTranslated: false
         }));
         setPages(initializedPages);
-        showToast(`Anime kitob yuklandi (${initializedPages.length} sahifa)`);
+        showToast(`${initializedPages.length} ta sahifa yuklandi. Avtomatik tarjima boshlandi...`);
       } else if ([".png", ".jpg", ".jpeg", ".webp"].includes(ext)) {
-        setStatusMessage("Manga rasmi yuklanmoqda...");
+        setStatusMessage("Rasm yuklanmoqda...");
         const reader = new FileReader();
-        reader.onload = (e) => {
-          const img = new Image();
-          img.onload = () => {
-            setPages([
-              {
-                pageNumber: 1,
-                dataUrl: e.target.result,
-                width: img.naturalWidth,
-                height: img.naturalHeight,
-                blocks: [],
-                isTranslated: false
-              }
-            ]);
-            showToast("Manga rasmi yuklandi");
-          };
-          img.src = e.target.result;
-        };
-        reader.readAsDataURL(file);
+        const dataUrl = await new Promise((res, rej) => {
+          reader.onload = (e) => res(e.target.result);
+          reader.onerror = rej;
+          reader.readAsDataURL(file);
+        });
+
+        const img = new Image();
+        await new Promise((res, rej) => {
+          img.onload = res;
+          img.onerror = rej;
+          img.src = dataUrl;
+        });
+
+        initializedPages = [
+          {
+            pageNumber: 1,
+            dataUrl,
+            width: img.naturalWidth,
+            height: img.naturalHeight,
+            blocks: [],
+            isTranslated: false
+          }
+        ];
+        setPages(initializedPages);
+        showToast("Rasm yuklandi. Avtomatik tarjima boshlandi...");
       } else {
         showToast("Iltimos, PDF yoki Rasm fayli yuklang!");
+        setIsProcessing(false);
+        return;
       }
+
+      // === AVTOMATIK TARJIMA (Foydalanuvchi tugma bosishi shart emas!) ===
+      await autoTranslatePages(initializedPages);
+
     } catch (err) {
       console.error(err);
       showToast("Faylni ochishda xatolik: " + err.message);
-    } finally {
       setIsProcessing(false);
       setStatusMessage("");
     }
@@ -134,14 +239,18 @@ export default function App() {
     img.src = currentPage.dataUrl;
   }, [currentPageIndex, pages, showOriginal]);
 
-  // 3. Joriy sahifadagi matnlarni aniqlash va o'zbekchaga tarjima qilish
+  // 3. Joriy sahifadagi matnlarni qo'shimcha qayta tarjima qilish
   const handleTranslateCurrentPage = async () => {
     if (!currentImgRef.current || !currentPage) return;
 
     setIsProcessing(true);
     try {
-      setStatusMessage("1/2: Inglizcha so'zlar va pufakchalar aniqlanmoqda (OCR)...");
-      const detected = await detectMangaText(currentImgRef.current, (msg) => setStatusMessage(msg));
+      setStatusMessage("Sahifadagi matnlar aniqlanmoqda...");
+      const detected = await detectMangaText(
+        currentImgRef.current,
+        (msg) => setStatusMessage(msg),
+        currentPage.embeddedItems
+      );
 
       if (detected.length === 0) {
         showToast("Bu sahifada inglizcha matn topilmadi.");
@@ -149,10 +258,9 @@ export default function App() {
         return;
       }
 
-      setStatusMessage(`2/2: ${detected.length} ta matn o'zbek tiliga tarjima qilinmoqda...`);
+      setStatusMessage(`${detected.length} ta matn o'zbek tiliga tarjima qilinmoqda...`);
       const translated = await translateMangaBlocks(detected, (msg) => setStatusMessage(msg));
 
-      // Sahifa ma'lumotlarini yangilash
       setPages((prev) =>
         prev.map((p, idx) =>
           idx === currentPageIndex
@@ -172,45 +280,10 @@ export default function App() {
     }
   };
 
-  // 4. Barcha sahifalarni ketma-ket avtomatik tarjima qilish
+  // 4. Barcha sahifalarni qayta tarjima qilish tugmasi
   const handleTranslateAllPages = async () => {
     if (pages.length === 0) return;
-
-    setIsProcessing(true);
-    try {
-      const updatedPages = [...pages];
-
-      for (let i = 0; i < updatedPages.length; i++) {
-        const p = updatedPages[i];
-        setStatusMessage(`Sahifa ${i + 1}/${updatedPages.length}: Matnlar skanerlanmoqda...`);
-
-        const img = new Image();
-        await new Promise((res) => {
-          img.onload = res;
-          img.src = p.dataUrl;
-        });
-
-        const detected = await detectMangaText(img);
-        if (detected.length > 0) {
-          setStatusMessage(`Sahifa ${i + 1}/${updatedPages.length}: Tarjima qilinmoqda (${detected.length} ta)...`);
-          const translated = await translateMangaBlocks(detected);
-          updatedPages[i] = {
-            ...p,
-            blocks: translated,
-            isTranslated: true
-          };
-        }
-      }
-
-      setPages(updatedPages);
-      showToast("Barcha sahifalar to'liq tarjima qilindi!");
-    } catch (err) {
-      console.error(err);
-      showToast("Xatolik: " + err.message);
-    } finally {
-      setIsProcessing(false);
-      setStatusMessage("");
-    }
+    await autoTranslatePages(pages);
   };
 
   // 5. Pufakcha matnini qo'lda o'zgartirish
@@ -495,22 +568,44 @@ export default function App() {
         {/* Progress Card */}
         {isProcessing && (
           <div className="card">
-            <div style={{ fontWeight: 600, fontSize: "0.9rem", color: "var(--primary)" }}>
-              {statusMessage || "Bajarilmoqda..."}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontWeight: 600, fontSize: "0.9rem", color: "var(--primary)" }}>
+              <span>⚡ {statusMessage || "Bajarilmoqda..."}</span>
+              <span>{progressPercent}%</span>
             </div>
             <div className="progress-bar-simple">
-              <div className="progress-bar-fill" style={{ width: "80%" }}></div>
+              <div className="progress-bar-fill" style={{ width: `${Math.max(5, progressPercent)}%` }}></div>
             </div>
           </div>
         )}
 
-        {/* Empty State */}
+        {/* Empty State / Dropzone */}
         {pages.length === 0 && (
-          <div className="simple-dropzone card" onClick={() => fileInputRef.current?.click()}>
+          <div
+            className={`simple-dropzone card ${isDragging ? "dragging" : ""}`}
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setIsDragging(true);
+            }}
+            onDragLeave={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setIsDragging(false);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setIsDragging(false);
+              if (e.dataTransfer?.files?.[0]) {
+                handleFileUpload(e.dataTransfer.files[0]);
+              }
+            }}
+          >
             <Languages size={48} style={{ margin: "0 auto 0.8rem", color: "var(--primary)" }} />
-            <h3>Anime Kitob (PDF) yoki Manga Rasmini Yuklang</h3>
+            <h3>Anime Kitob (PDF) yoki Manga Rasmini Tashlang yoki Yuklang</h3>
             <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginTop: "0.4rem", maxWidth: "600px", margin: "0.4rem auto 0" }}>
-              PDF kitoblar yoki rasmlar ichidagi barcha dialog pufakchalari va "Main Quest" tizim oynalaridagi inglizcha so'zlar avtomatik aniqlanadi, asl chizmani o'zgartirmasdan o'zbek tiliga tarjima qilinadi.
+              PDF kitobni bu yerga tashlashingiz bilan barcha sahifalaridagi matnlar o'z joyida avtomatik tarzda o'zbek tiliga tarjima qilinadi.
             </p>
           </div>
         )}
