@@ -40,7 +40,31 @@ const MANGA_GLOSSARY = new Map([
   ["clang", "Jang!"],
   ["smirk", "Irg'ayib..."],
   ["huff... huff...", "Hantirab..."],
-  ["pant... pant...", "Hansirab..."]
+  ["pant... pant...", "Hansirab..."],
+
+  // Manga / Webtoon jang va dialog iboralari
+  ["ajie still does not know exactly what my ability is", "Ajie hali mening qobiliyatim nimaligini aniq bilmaydi"],
+  ["ajie still doesn't know exactly what my ability is", "Ajie hali mening qobiliyatim nimaligini aniq bilmaydi"],
+  ["i'll humor you just this once", "Faqat shu safar senga yon bosaman"],
+  ["i will humor you just this once", "Faqat shu safar senga yon bosaman"],
+  ["i'll humor you", "Mayli, senga yon bosaman"],
+  ["i will humor you", "Mayli, senga yon bosaman"],
+  ["humor you", "senga yon bosish"],
+  ["use whatever you want", "Xohlagan narsangdan foydalan"],
+  ["just land one clean hit on me", "Menga bitta aniq zarba bera olsang bas"],
+  ["land one clean hit on me", "Menga bitta aniq zarba ber"],
+  ["just land one clean hit", "bitta aniq zarba bersang bas"],
+  ["one clean hit", "bitta aniq zarba"],
+  ["clean hit", "aniq zarba"],
+  ["clean strike", "aniq zarba"],
+  ["nice try", "Yaxshi urinish"],
+  ["not bad", "Yomon emas"],
+  ["give up", "Taslim bo'l"],
+  ["never give up", "Hech qachon taslim bo'lma"],
+  ["don't worry", "Xavotir olma"],
+  ["follow me", "Menga ergash"],
+  ["watch out", "Ehtiyot bo'l!"],
+  ["get back", "Ortga chekin!"]
 ]);
 
 // 2. Tarjimadan oldingi qoidalar (Pre-Translation Normalization):
@@ -129,6 +153,21 @@ const POST_RULES = [
   [/\bgalaba\b/gi, "g'alaba"],
   [/\bGalaba\b/g, "G'alaba"],
 
+  // Mashina tarjimasining manga dialoglaridagi noaniqliklarini to'g'rilash
+  [/\bhani\b/gi, "hali"],
+  [/\bhani aniq\b/gi, "hali aniq"],
+  [/\btoza menga urdi\b/gi, "menga aniq zarba ber"],
+  [/\btoza urdi\b/gi, "aniq zarba berdi"],
+  [/\btoza zarba\b/gi, "aniq zarba"],
+  [/\bhazil beraman\b/gi, "yon bosaman"],
+  [/\bhazil qilaman\b/gi, "aytganingdek qilaman"],
+  [/\bnarasini hoxlasangiz\b/gi, "xohlagan narsangizdan"],
+  [/\bnarasini xohlasangiz\b/gi, "xohlagan narsangizdan"],
+  [/\bnarsasini hoxlasangiz\b/gi, "xohlagan narsangizdan"],
+  [/\bnarsasini xohlasangiz\b/gi, "xohlagan narsangizdan"],
+  [/\bo['‘`]sha erga\b/gi, "o'sha yerga"],
+  [/\bO['‘`]sha erga\b/g, "O'sha yerga"],
+
   // Egri tirnoqlarni standartlashtirish
   [/[‘’`ʻ]/g, "'"]
 ];
@@ -170,14 +209,40 @@ export async function translateSingleText(text, sourceLang = "en", targetLang = 
   if (!text || !text.trim()) return text;
 
   const rawText = text.trim();
-  const isUpper = rawText.length > 2 && rawText === rawText.toUpperCase() && /[A-Z]/.test(rawText);
+  const uppercaseLetters = (rawText.match(/[A-Z]/g) || []).length;
+  const totalLetters = (rawText.match(/[a-zA-Z]/g) || []).length;
+  // 78%+ bosh harflar bo'lsa (manga lettering ko'pincha ALL-CAPS bo'ladi)
+  const isUpper = totalLetters > 2 && (uppercaseLetters / totalLetters) >= 0.78;
   const startsWithCapital = /[A-Z]/.test(rawText.charAt(0));
 
   // 1. Manga Lug'ati (Glossary) orqali tekshirish
-  const cleanLookup = rawText.toLowerCase().replace(/[!?:.]+$/, "").trim();
+  const cleanLookup = rawText.toLowerCase().replace(/[,!?:.]+$/, "").trim();
   if (sourceLang === "en" && targetLang === "uz" && MANGA_GLOSSARY.has(cleanLookup)) {
     const gloss = MANGA_GLOSSARY.get(cleanLookup);
     return isUpper ? gloss.toUpperCase() : gloss;
+  }
+
+  // 1.1 Ko'p gapli dialoglarni (Compound sentences) lug'at orqali tekshirish
+  if (sourceLang === "en" && targetLang === "uz" && /[.!?]/.test(rawText)) {
+    const sentences = rawText.split(/(?<=[.!?])\s+/);
+    if (sentences.length > 1) {
+      let allFound = true;
+      const translatedSentences = [];
+      for (const sent of sentences) {
+        const cl = sent.toLowerCase().replace(/[,!?:.]+$/, "").trim();
+        if (MANGA_GLOSSARY.has(cl)) {
+          const punct = sent.match(/[!?:.]+$/)?.[0] || ".";
+          translatedSentences.push(MANGA_GLOSSARY.get(cl) + punct);
+        } else {
+          allFound = false;
+          break;
+        }
+      }
+      if (allFound) {
+        const res = translatedSentences.join(" ");
+        return isUpper ? res.toUpperCase() : res;
+      }
+    }
   }
 
   const cacheKey = `${sourceLang}_${targetLang}_${rawText.toLowerCase()}`;

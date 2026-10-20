@@ -109,11 +109,10 @@ export default function App() {
           img.src = p.dataUrl;
         });
 
-        // 1. Matnlarni aniqlash (Raqamli PDF bo'lsa embeddedItems, rasm bo'lsa OCR)
+        // 1. Matnlarni aniqlash (Manga sahifasidagi dialoglarni OCR orqali aniqlash)
         const detected = await detectMangaText(
           img,
-          (msg) => setStatusMessage(`Sahifa ${i + 1}/${updatedPages.length}: ${msg}`),
-          p.embeddedItems
+          (msg) => setStatusMessage(`Sahifa ${i + 1}/${updatedPages.length}: ${msg}`)
         );
 
         if (detected.length > 0) {
@@ -248,8 +247,7 @@ export default function App() {
       setStatusMessage("Sahifadagi matnlar aniqlanmoqda...");
       const detected = await detectMangaText(
         currentImgRef.current,
-        (msg) => setStatusMessage(msg),
-        currentPage.embeddedItems
+        (msg) => setStatusMessage(msg)
       );
 
       if (detected.length === 0) {

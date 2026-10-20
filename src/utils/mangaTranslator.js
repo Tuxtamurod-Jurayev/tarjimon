@@ -59,7 +59,7 @@ export async function loadPdfPages(file, onProgress) {
     }
 
     const page = await pdf.getPage(i);
-    // 2.0x masshtab - matnlar juda aniq ko'rinishi va OCR xatosiz o'qishi uchun
+    // 2.0x masshtab - manga chizmalari va dialog matnlari OCR uchun o'ta tiniq bo'lishi uchun
     const viewport = page.getViewport({ scale: 2.0 });
 
     const canvas = document.createElement("canvas");
@@ -69,51 +69,11 @@ export async function loadPdfPages(file, onProgress) {
 
     await page.render({ canvasContext: ctx, viewport }).promise;
 
-    // Sahifadagi mavjud raqamli matnlarni (embedded text layer) tekshirish
-    let embeddedItems = [];
-    try {
-      const textContent = await page.getTextContent();
-      if (textContent?.items?.length > 0) {
-        for (const it of textContent.items) {
-          const str = (it.str || "").trim();
-          if (!str) continue;
-
-          const tx = it.transform[4];
-          const ty = it.transform[5];
-          const [vx, vy] = viewport.convertToViewportPoint(tx, ty);
-
-          const fontHeight = Math.max(10, (Math.hypot(it.transform[0], it.transform[1]) || it.height || 12) * viewport.scale);
-          const width = Math.max(8, (it.width || str.length * 7) * viewport.scale);
-
-          const x0 = Math.round(vx);
-          const y0 = Math.round(vy - fontHeight);
-          const x1 = Math.round(x0 + width);
-          const y1 = Math.round(vy + fontHeight * 0.15);
-
-          embeddedItems.push({
-            text: str,
-            confidence: 99,
-            bbox: {
-              x0,
-              y0,
-              x1,
-              y1,
-              width: x1 - x0,
-              height: y1 - y0
-            }
-          });
-        }
-      }
-    } catch (e) {
-      console.warn("Embedded text extraction:", e);
-    }
-
     pages.push({
       pageNumber: i,
       dataUrl: canvas.toDataURL("image/jpeg", 0.95),
       width: viewport.width,
-      height: viewport.height,
-      embeddedItems: embeddedItems.length > 0 ? embeddedItems : null
+      height: viewport.height
     });
   }
 
@@ -127,7 +87,8 @@ export async function loadPdfPages(file, onProgress) {
 function isMeaningfulText(text, confidence) {
   if (!text) return false;
   const trimmed = text.trim();
-  if (trimmed.length < 2) return false;
+  if (trimmed.length < 1) return false;
+  if (trimmed.length === 1 && !/^[a-zA-Z]$/.test(trimmed)) return false;
 
   // Kamida bitta harf bo'lishi shart
   const letterMatches = trimmed.match(/[a-zA-Z]/g);
@@ -136,9 +97,9 @@ function isMeaningfulText(text, confidence) {
   // Faqat raqamlar bo'lsa (masalan sahifa raqamlari "12", "01") dialog emas
   if (/^\d+$/.test(trimmed)) return false;
 
-  // Harflarning umumiy belgilarga nisbati kamida 35% bo'lsin
+  // Harflarning umumiy belgilarga nisbati kamida 30% bo'lsin
   const letterRatio = letterMatches.length / trimmed.length;
-  if (letterRatio < 0.35) return false;
+  if (letterRatio < 0.30) return false;
 
   // Faqat takroriy belgilar (masalan: "---", "|||", "...")
   if (/^[^a-zA-Z0-9]+$/.test(trimmed)) return false;
@@ -146,10 +107,10 @@ function isMeaningfulText(text, confidence) {
   // Agar kamida bitta 2+ harfli haqiqiy so'z bo'lsa
   const hasRealWord = /\b[a-zA-Z]{2,}\b/.test(trimmed);
   if (hasRealWord) {
-    return confidence >= 20;
+    return confidence >= 15;
   }
 
-  return confidence >= 45;
+  return confidence >= 40;
 }
 
 /**
@@ -158,8 +119,8 @@ function isMeaningfulText(text, confidence) {
 function cleanOcrLine(raw) {
   if (!raw) return "";
   let s = raw.trim();
-  // Chegaradagi xato belgilarni olib tashlash
-  s = s.replace(/^[|~_—\-[\]{}()<>/\\=]+|[|~_—\-[\]{}()<>/\\=]+$/g, "").trim();
+  // Chegaradagi xato belgilarni olib tashlash (ikki chetdagi : ; ~ _ — - [] {} () <> / \ = | belgilari)
+  s = s.replace(/^[:;~_—\-[\]{}()<>/\\=|\s]+/, "").replace(/[:;~_—\-[\]{}()<>/\\=|\s]+$/, "").trim();
   // OCR ba'zida 'I' ni '|' yoki '1' deb o'qiydi
   s = s.replace(/\b1\s/g, "I ").replace(/\|\s/g, "I ").replace(/\bl\s/g, "I ");
   // Ko'p bo'shliqlarni bitta bo'shliqqa keltirish
@@ -168,8 +129,35 @@ function cleanOcrLine(raw) {
 }
 
 /**
+ * Tesseract satridagi haqiqiy so'zlar orqali aniq bounding box hisoblash.
+ * Satr boshidagi/oxiridagi chetki shovqin belgilari (masalan pufakcha devori ':' yoki '|')
+ * koordinatalarni chetga surib yubormasligi uchun so'zlardan o'lchanadi.
+ */
+function getAccurateLineBbox(l) {
+  if (l.words && l.words.length > 0) {
+    const validWords = l.words.filter(w => {
+      const t = (w.text || "").trim();
+      if (/^[:;~_—\-[\]{}()<>/\\=|\s]+$/.test(t) && (w.confidence < 60 || t.length <= 1)) return false;
+      return t.length > 0;
+    });
+
+    if (validWords.length > 0) {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const w of validWords) {
+        if (w.bbox.x0 < x0) x0 = w.bbox.x0;
+        if (w.bbox.y0 < y0) y0 = w.bbox.y0;
+        if (w.bbox.x1 > x1) x1 = w.bbox.x1;
+        if (w.bbox.y1 > y1) y1 = w.bbox.y1;
+      }
+      return { x0, y0, x1, y1, width: x1 - x0, height: y1 - y0 };
+    }
+  }
+  return { ...l.bbox, width: l.bbox.x1 - l.bbox.x0, height: l.bbox.y1 - l.bbox.y0 };
+}
+
+/**
  * zyddnys textline_merge: Ikki qator bir dialog pufakchasiga tegishli ekanligini aniqlash
- * Masofa, markazlashtirish, qator balandligi va defislar hisobga olinadi.
+ * Masofa, markazlashtirish, qator balandligi va gorizontal ustma-ust tushish (overlap) hisobga olinadi.
  */
 function canMergeLines(box, line) {
   const vDist = line.bbox.y0 - box.y1;
@@ -177,21 +165,24 @@ function canMergeLines(box, line) {
   const boxH = Math.max(14, (box.y1 - box.y0) / Math.max(1, box.lines.length));
   const avgFontSize = Math.max(lineH, boxH);
 
-  // Vertikal masofa shart: satrlar bir-biriga yaqin (maksimal 1.1 * font_size)
-  const isVerticallyAdjacent = vDist >= -8 && vDist <= avgFontSize * 1.1;
+  // Vertikal masofa shart: satrlar bir-biriga yaqin (maksimal 1.6 * font_size yoki 45px)
+  const isVerticallyAdjacent = vDist >= -12 && vDist <= Math.max(45, avgFontSize * 1.6);
   if (!isVerticallyAdjacent) return false;
 
-  // Gorizontal moslik: manga pufakchalarida satrlar ko'pincha markazlashtiriladi
+  // Gorizontal moslik:
+  // 1. Gorizontal ustma-ust tushish (overlap) - bir pufakchadagi satrlar bir-biriga tushadi
+  const overlap = Math.min(box.x1, line.bbox.x1) - Math.max(box.x0, line.bbox.x0);
+  if (overlap > 15) return true;
+
+  // 2. Markaz masofasi
   const boxCenterX = (box.x0 + box.x1) / 2;
   const lineCenterX = (line.bbox.x0 + line.bbox.x1) / 2;
   const boxWidth = box.x1 - box.x0;
   const lineWidth = line.bbox.x1 - line.bbox.x0;
   const centerDist = Math.abs(boxCenterX - lineCenterX);
 
-  const maxAllowedCenterOffset = Math.max(boxWidth, lineWidth) * 0.55 + 15;
-  const isHorizontallyAligned = centerDist <= maxAllowedCenterOffset;
-
-  return isHorizontallyAligned;
+  const maxAllowedCenterOffset = Math.max(boxWidth, lineWidth) * 0.55 + 25;
+  return centerDist <= maxAllowedCenterOffset;
 }
 
 /**
@@ -319,52 +310,6 @@ function detectBoxColors(ctx, box) {
 }
 
 /**
- * PDF dagi alohida so'zlarni bitta satrga birlashtirish
- */
-function mergePdfTextItems(items) {
-  if (!items || items.length === 0) return [];
-  const sorted = [...items].sort((a, b) => {
-    if (Math.abs(a.bbox.y0 - b.bbox.y0) < 10) {
-      return a.bbox.x0 - b.bbox.x0;
-    }
-    return a.bbox.y0 - b.bbox.y0;
-  });
-
-  const lines = [];
-  let cur = null;
-
-  for (const it of sorted) {
-    if (!cur) {
-      cur = {
-        text: it.text,
-        confidence: 99,
-        bbox: { ...it.bbox }
-      };
-    } else {
-      const sameLine = Math.abs(cur.bbox.y0 - it.bbox.y0) < 12;
-      const xDist = it.bbox.x0 - cur.bbox.x1;
-      // Agar bitta qatorda va bir-biriga yaqin bo'lsa
-      if (sameLine && xDist >= -5 && xDist <= 40) {
-        cur.text += (xDist > 2 ? " " : "") + it.text;
-        cur.bbox.x1 = Math.max(cur.bbox.x1, it.bbox.x1);
-        cur.bbox.y1 = Math.max(cur.bbox.y1, it.bbox.y1);
-        cur.bbox.width = cur.bbox.x1 - cur.bbox.x0;
-        cur.bbox.height = cur.bbox.y1 - cur.bbox.y0;
-      } else {
-        lines.push(cur);
-        cur = {
-          text: it.text,
-          confidence: 99,
-          bbox: { ...it.bbox }
-        };
-      }
-    }
-  }
-  if (cur) lines.push(cur);
-  return lines;
-}
-
-/**
  * Katta hajmdagi manga sahifalarini OCR uchun tezkor o'lchamga keltirish
  * (WASM xotira xatolarining oldini oladi va skanerlashni 10 barobar tezlashtiradi)
  */
@@ -390,58 +335,41 @@ function getOcrReadyImage(imageElement, maxDim = 1600) {
 }
 
 /**
- * Rasmdagi inglizcha matnlarni aniqlash (Embedded text yoki Tesseract OCR orqali)
+ * Manga sahifasidagi inglizcha dialoglarni aniqlash (Tesseract OCR Engine)
  */
-export async function detectMangaText(imageElement, onProgress, embeddedItems = null) {
-  let extractedLines = [];
+export async function detectMangaText(imageElement, onProgress) {
+  const extractedLines = [];
 
-  // 1. Agar PDF dan olingan raqamli matnlar bo'lsa (o'ta tezkor va 100% aniq)
-  if (embeddedItems && embeddedItems.length > 0) {
-    if (onProgress) onProgress("Sahifadagi matnlar tahlil qilinmoqda...");
-    const mergedLines = mergePdfTextItems(embeddedItems);
-    for (const l of mergedLines) {
-      const clean = cleanOcrLine(l.text);
-      if (isMeaningfulText(clean, l.confidence)) {
-        extractedLines.push({
-          text: clean,
-          confidence: l.confidence,
-          bbox: l.bbox
-        });
-      }
-    }
-  }
+  if (onProgress) onProgress("Sahifadagi dialoglar skanerlanmoqda (OCR)...");
 
-  // 2. Agar PDF da raqamli matn bo'lmasa (skanerlangan rasm / komiks), Tesseract OCR orqali skanerlash
-  if (extractedLines.length === 0) {
-    if (onProgress) onProgress("Sahifadagi dialoglar skanerlanmoqda (OCR)...");
+  const { target: ocrTarget, scaleFactor } = getOcrReadyImage(imageElement, 1600);
+  const worker = await getOcrWorker(onProgress);
 
-    const { target: ocrTarget, scaleFactor } = getOcrReadyImage(imageElement, 1600);
-    const worker = await getOcrWorker(onProgress);
+  // Tesseract orqali bloklar va qatorlarni aniqlash
+  const ret = await worker.recognize(ocrTarget, {}, { blocks: true });
 
-    // Tesseract bboxes olish
-    const ret = await worker.recognize(ocrTarget, {}, { blocks: true, text: true });
-
-    if (ret.data && ret.data.blocks) {
-      for (const block of ret.data.blocks) {
-        if (!block.paragraphs) continue;
-        for (const p of block.paragraphs) {
-          if (!p.lines) continue;
-          for (const l of p.lines) {
-            const cleanText = cleanOcrLine(l.text || "");
-            if (isMeaningfulText(cleanText, l.confidence)) {
-              extractedLines.push({
-                text: cleanText,
-                confidence: l.confidence,
-                bbox: {
-                  x0: Math.round(l.bbox.x0 * scaleFactor),
-                  y0: Math.round(l.bbox.y0 * scaleFactor),
-                  x1: Math.round(l.bbox.x1 * scaleFactor),
-                  y1: Math.round(l.bbox.y1 * scaleFactor),
-                  width: Math.round((l.bbox.x1 - l.bbox.x0) * scaleFactor),
-                  height: Math.round((l.bbox.y1 - l.bbox.y0) * scaleFactor)
-                }
-              });
-            }
+  if (ret.data && ret.data.blocks) {
+    for (const block of ret.data.blocks) {
+      if (!block.paragraphs) continue;
+      for (const p of block.paragraphs) {
+        if (!p.lines) continue;
+        for (const l of p.lines) {
+          const cleanText = cleanOcrLine(l.text || "");
+          if (isMeaningfulText(cleanText, l.confidence)) {
+            // Pufakcha chetki chiziqlari (masalan ':' yoki '|') xato koordinata bermasligi uchun
+            const accBbox = getAccurateLineBbox(l);
+            extractedLines.push({
+              text: cleanText,
+              confidence: l.confidence,
+              bbox: {
+                x0: Math.round(accBbox.x0 * scaleFactor),
+                y0: Math.round(accBbox.y0 * scaleFactor),
+                x1: Math.round(accBbox.x1 * scaleFactor),
+                y1: Math.round(accBbox.y1 * scaleFactor),
+                width: Math.round(accBbox.width * scaleFactor),
+                height: Math.round(accBbox.height * scaleFactor)
+              }
+            });
           }
         }
       }
