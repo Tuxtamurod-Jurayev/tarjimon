@@ -20,14 +20,17 @@ let ocrWorker = null;
 // Tesseract OCR ishchisini tayyorlash
 export async function getOcrWorker(onProgress) {
   if (!ocrWorker) {
-    if (onProgress) onProgress("OCR dvigateli yuklanmoqda...");
+    if (onProgress) onProgress("OCR dvigateli ishga tushirilmoqda...");
     try {
-      // Avval lokal serverdan (public/eng.traineddata) tezkor yuklash
       ocrWorker = await createWorker("eng", 1, {
-        langPath: window.location.origin
+        logger: (m) => {
+          if (m?.status === "recognizing text" && onProgress) {
+            onProgress(`Matn o'qilmoqda: ${Math.round((m.progress || 0) * 100)}%`);
+          }
+        }
       });
     } catch (e) {
-      console.warn("Lokal traineddata yuklanmadi, standart CDN ga o'tilmoqda:", e);
+      console.warn("Standart worker xatoligi, qayta urinilmoqda:", e);
       ocrWorker = await createWorker("eng");
     }
   }
@@ -119,7 +122,7 @@ export async function loadPdfPages(file, onProgress) {
 
 /**
  * OCR orqali aniqlangan matn haqiqiy dialog ekanligini tekshirish
- * (Rasmdagi shovqinlar, panjaralar, chiziqlar va fon teksturalarini filtrlaydi)
+ * (Sahifa raqamlari, shovqinlar, panjaralar va fon teksturalarini filtrlaydi)
  */
 function isMeaningfulText(text, confidence) {
   if (!text) return false;
@@ -128,11 +131,14 @@ function isMeaningfulText(text, confidence) {
 
   // Kamida bitta harf bo'lishi shart
   const letterMatches = trimmed.match(/[a-zA-Z]/g);
-  if (!letterMatches || letterMatches.length < 2) return false;
+  if (!letterMatches || letterMatches.length < 1) return false;
 
-  // Harflarning umumiy belgilarga nisbati kamida 40% bo'lsin
+  // Faqat raqamlar bo'lsa (masalan sahifa raqamlari "12", "01") dialog emas
+  if (/^\d+$/.test(trimmed)) return false;
+
+  // Harflarning umumiy belgilarga nisbati kamida 35% bo'lsin
   const letterRatio = letterMatches.length / trimmed.length;
-  if (letterRatio < 0.4) return false;
+  if (letterRatio < 0.35) return false;
 
   // Faqat takroriy belgilar (masalan: "---", "|||", "...")
   if (/^[^a-zA-Z0-9]+$/.test(trimmed)) return false;
@@ -140,10 +146,10 @@ function isMeaningfulText(text, confidence) {
   // Agar kamida bitta 2+ harfli haqiqiy so'z bo'lsa
   const hasRealWord = /\b[a-zA-Z]{2,}\b/.test(trimmed);
   if (hasRealWord) {
-    return confidence >= 25;
+    return confidence >= 20;
   }
 
-  return confidence >= 50;
+  return confidence >= 45;
 }
 
 /**
@@ -359,6 +365,31 @@ function mergePdfTextItems(items) {
 }
 
 /**
+ * Katta hajmdagi manga sahifalarini OCR uchun tezkor o'lchamga keltirish
+ * (WASM xotira xatolarining oldini oladi va skanerlashni 10 barobar tezlashtiradi)
+ */
+function getOcrReadyImage(imageElement, maxDim = 1600) {
+  const origW = imageElement.naturalWidth || imageElement.width || 1000;
+  const origH = imageElement.naturalHeight || imageElement.height || 1400;
+
+  if (origW <= maxDim && origH <= maxDim) {
+    return { target: imageElement, scaleFactor: 1.0 };
+  }
+
+  const factor = maxDim / Math.max(origW, origH);
+  const targetW = Math.round(origW * factor);
+  const targetH = Math.round(origH * factor);
+
+  const cvs = document.createElement("canvas");
+  cvs.width = targetW;
+  cvs.height = targetH;
+  const ctx = cvs.getContext("2d");
+  ctx.drawImage(imageElement, 0, 0, targetW, targetH);
+
+  return { target: cvs, scaleFactor: origW / targetW };
+}
+
+/**
  * Rasmdagi inglizcha matnlarni aniqlash (Embedded text yoki Tesseract OCR orqali)
  */
 export async function detectMangaText(imageElement, onProgress, embeddedItems = null) {
@@ -382,12 +413,13 @@ export async function detectMangaText(imageElement, onProgress, embeddedItems = 
 
   // 2. Agar PDF da raqamli matn bo'lmasa (skanerlangan rasm / komiks), Tesseract OCR orqali skanerlash
   if (extractedLines.length === 0) {
-    if (onProgress) onProgress("Sahifadagi matnlar skanerlanmoqda (OCR)...");
+    if (onProgress) onProgress("Sahifadagi dialoglar skanerlanmoqda (OCR)...");
 
-    const worker = await getOcrWorker();
+    const { target: ocrTarget, scaleFactor } = getOcrReadyImage(imageElement, 1600);
+    const worker = await getOcrWorker(onProgress);
 
     // Tesseract bboxes olish
-    const ret = await worker.recognize(imageElement, {}, { blocks: true, text: true });
+    const ret = await worker.recognize(ocrTarget, {}, { blocks: true, text: true });
 
     if (ret.data && ret.data.blocks) {
       for (const block of ret.data.blocks) {
@@ -400,7 +432,14 @@ export async function detectMangaText(imageElement, onProgress, embeddedItems = 
               extractedLines.push({
                 text: cleanText,
                 confidence: l.confidence,
-                bbox: l.bbox
+                bbox: {
+                  x0: Math.round(l.bbox.x0 * scaleFactor),
+                  y0: Math.round(l.bbox.y0 * scaleFactor),
+                  x1: Math.round(l.bbox.x1 * scaleFactor),
+                  y1: Math.round(l.bbox.y1 * scaleFactor),
+                  width: Math.round((l.bbox.x1 - l.bbox.x0) * scaleFactor),
+                  height: Math.round((l.bbox.y1 - l.bbox.y0) * scaleFactor)
+                }
               });
             }
           }
